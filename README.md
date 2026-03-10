@@ -12,6 +12,7 @@ Low ceremony. High signal. Snapshot the repo, run the agent, inspect the diff, a
 - shows summary and changed files
 - supports inspect / apply / reject flow
 - can commit per file or as one commit
+- defaults to a single commit when applying changes
 - can push after apply
 - filters generated junk from change detection
 
