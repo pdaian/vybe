@@ -71,6 +71,10 @@ At the end, provide a concise summary of what changed.
 GIT_REMOTE_NAME = "origin"
 GIT_REMOTE_USERNAME = ""
 GIT_REMOTE_TOKEN = ""
+# Default credential file format:
+#   line 1: GitHub username
+#   line 2: GitHub PAT/token
+GITHUB_PAT_FILE = Path.home() / "github.pat"
 COMMIT_MODE = "per-file"   # "per-file" or "single"
 COMMIT_PREFIX = "codex"
 
@@ -290,6 +294,19 @@ def tokenized_https_url(url: str, username: str, token: str) -> str:
         raise SystemExit("Only HTTPS remotes are supported for embedded token auth.")
     rest = url[len("https://"):]
     return f"https://{username}:{token}@{rest}"
+
+
+def resolve_git_remote_credentials() -> Tuple[str, str]:
+    if GIT_REMOTE_USERNAME and GIT_REMOTE_TOKEN:
+        return GIT_REMOTE_USERNAME, GIT_REMOTE_TOKEN
+
+    if not GITHUB_PAT_FILE.is_file():
+        return GIT_REMOTE_USERNAME, GIT_REMOTE_TOKEN
+
+    lines = GITHUB_PAT_FILE.read_text(encoding="utf-8").splitlines()
+    username = lines[0].strip() if len(lines) >= 1 else ""
+    token = lines[1].strip() if len(lines) >= 2 else ""
+    return username, token
 
 
 def build_git_env() -> Dict[str, str]:
@@ -956,7 +973,8 @@ def commit(repo: Path, message: str) -> None:
 
 def push_branch(repo: Path, branch: str) -> None:
     remote_url = git_remote_url(repo, GIT_REMOTE_NAME)
-    push_url = tokenized_https_url(remote_url, GIT_REMOTE_USERNAME, GIT_REMOTE_TOKEN)
+    username, token = resolve_git_remote_credentials()
+    push_url = tokenized_https_url(remote_url, username, token)
     run_cmd(["git", "push", push_url, f"HEAD:{branch}"], cwd=repo, env=build_git_env())
 
 
