@@ -1,0 +1,1137 @@
+#!/usr/bin/env python3
+"""
+codex.py
+
+Run from inside a git repo, even if this script lives outside it:
+
+    sudo cp vybe /usr/bin/vybe && sudo chmod +x /usr/bin/vybe
+    (^ install)
+    cd my-repo
+    python3 ../codex.py
+
+Features:
+- Long-running prompt loop
+- Multiline Codex task input
+- Submit multiline task input with 4 blank lines in a row
+- Runs `codex exec` in a temp snapshot of the repo
+- Shows summary + changed files
+- apply / reject / inspect flow
+- Per-file or single commit mode
+- Pushes to remote after apply
+- Repo root resolved from CURRENT WORKING DIRECTORY
+- Filters ignored/generated files from change detection
+- Big low-flicker radar/matrix animation while Codex runs
+- Static matrix-style panel before input, without breaking typing
+
+Notes:
+- Use an HTTPS token/PAT, not a password.
+- Do not commit this script with real secrets inside it.
+"""
+
+from __future__ import annotations
+
+import difflib
+import fnmatch
+import os
+import random
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+SCRIPT_PATH = Path(__file__).resolve()
+
+CODEX_BINARY = "codex"
+CODEX_MODEL = "gpt-5.4"
+CODEX_SANDBOX = "workspace-write"
+CODEX_ENABLE_WEB_SEARCH = False
+CODEX_USE_JSON_IF_AVAILABLE = True
+OPENAI_API_KEY = ""
+
+CODEX_EXTRA_SUFFIX = """
+Please make the requested changes directly in the repository files.
+Keep the solution minimal, correct, and production-ready.
+Do not create caches, build artifacts, test output files, coverage files, or temporary files.
+Avoid __pycache__, .pytest_cache, .mypy_cache, dist, build, coverage outputs, and similar generated files.
+At the end, provide a concise summary of what changed.
+"""
+
+GIT_REMOTE_NAME = "origin"
+GIT_REMOTE_USERNAME = ""
+GIT_REMOTE_TOKEN = ""
+COMMIT_MODE = "per-file"   # "per-file" or "single"
+COMMIT_PREFIX = "codex"
+
+SHOW_FULL_CODEX_STREAM = True
+MAX_FILE_LIST_WIDTH = 120
+
+SPINNER_INTERVAL = 0.10
+RADAR_INTERVAL = 0.14
+RADAR_WIDTH = 38
+RADAR_HEIGHT = 6
+
+IGNORE_GLOBS = [
+    "__pycache__",
+    "__pycache__/*",
+    "**/__pycache__",
+    "**/__pycache__/*",
+    ".pytest_cache",
+    ".pytest_cache/*",
+    "**/.pytest_cache",
+    "**/.pytest_cache/*",
+    ".mypy_cache",
+    ".mypy_cache/*",
+    "**/.mypy_cache",
+    "**/.mypy_cache/*",
+    ".ruff_cache",
+    ".ruff_cache/*",
+    "**/.ruff_cache",
+    "**/.ruff_cache/*",
+    ".coverage",
+    ".coverage.*",
+    "htmlcov",
+    "htmlcov/*",
+    "**/htmlcov",
+    "**/htmlcov/*",
+    ".tox",
+    ".tox/*",
+    "**/.tox",
+    "**/.tox/*",
+    ".nox",
+    ".nox/*",
+    "**/.nox",
+    "**/.nox/*",
+    ".hypothesis",
+    ".hypothesis/*",
+    "**/.hypothesis",
+    "**/.hypothesis/*",
+    ".cache",
+    ".cache/*",
+    "**/.cache",
+    "**/.cache/*",
+    "*.pyc",
+    "*.pyo",
+    "*.pyd",
+    "*.so",
+    "*.dylib",
+    "*.egg-info",
+    "*.egg-info/*",
+    "dist",
+    "dist/*",
+    "build",
+    "build/*",
+    "tmp",
+    "tmp/*",
+    "temp",
+    "temp/*",
+]
+
+# =============================================================================
+# ANSI COLORS
+# =============================================================================
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+
+# =============================================================================
+# DATA TYPES
+# =============================================================================
+
+@dataclass
+class CodexSupport:
+    has_json: bool
+    has_output_last_message: bool
+    has_search: bool
+
+
+@dataclass
+class ChangedFile:
+    path: str
+    status: str   # A, M, D
+    old_abs: Optional[Path]
+    new_abs: Optional[Path]
+
+
+@dataclass
+class RunResult:
+    prompt: str
+    summary: str
+    changed_files: List[ChangedFile]
+    temp_root: Path
+    snapshot_dir: Path
+    working_dir: Path
+
+
+# =============================================================================
+# ERRORS
+# =============================================================================
+
+class CommandError(RuntimeError):
+    pass
+
+
+# =============================================================================
+# BASIC HELPERS
+# =============================================================================
+
+def c(text: str, color: str) -> str:
+    return f"{color}{text}{RESET}"
+
+
+def banner(title: str) -> None:
+    line = "=" * 88
+    print(f"\n{line}\n{title}\n{line}")
+
+
+def info(text: str) -> None:
+    print(c(text, CYAN))
+
+
+def warn(text: str) -> None:
+    print(c(text, YELLOW))
+
+
+def err(text: str) -> None:
+    print(c(text, RED))
+
+
+def ok(text: str) -> None:
+    print(c(text, GREEN))
+
+
+def supports_ansi() -> bool:
+    return sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
+
+
+def run_cmd(
+    args: Sequence[str],
+    *,
+    cwd: Optional[Path] = None,
+    env: Optional[Dict[str, str]] = None,
+    check: bool = True,
+    capture: bool = True,
+    input_text: Optional[str] = None,
+) -> subprocess.CompletedProcess:
+    proc = subprocess.run(
+        list(args),
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        text=True,
+        capture_output=capture,
+        input=input_text,
+    )
+    if check and proc.returncode != 0:
+        cmd_str = " ".join(shlex.quote(x) for x in args)
+        raise CommandError(
+            f"Command failed ({proc.returncode}): {cmd_str}\n"
+            f"STDOUT:\n{proc.stdout}\n"
+            f"STDERR:\n{proc.stderr}"
+        )
+    return proc
+
+
+def ensure_binary(name: str) -> None:
+    if shutil.which(name) is None:
+        raise SystemExit(f"Missing required binary in PATH: {name}")
+
+
+def resolve_repo_root_from_cwd() -> Path:
+    cwd = Path.cwd().resolve()
+    proc = run_cmd(["git", "rev-parse", "--show-toplevel"], cwd=cwd)
+    return Path(proc.stdout.strip()).resolve()
+
+
+def get_repo_root() -> Path:
+    return resolve_repo_root_from_cwd()
+
+
+def get_current_branch(repo: Path) -> str:
+    proc = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo)
+    branch = proc.stdout.strip()
+    if branch == "HEAD":
+        raise SystemExit("Detached HEAD is not supported.")
+    return branch
+
+
+def ensure_clean_repo(repo: Path) -> None:
+    proc = run_cmd(["git", "status", "--porcelain"], cwd=repo)
+    if proc.stdout.strip():
+        raise SystemExit(
+            "Working tree is not clean. Commit, stash, or discard local changes first."
+        )
+
+
+def git_remote_url(repo: Path, remote_name: str) -> str:
+    proc = run_cmd(["git", "remote", "get-url", remote_name], cwd=repo)
+    return proc.stdout.strip()
+
+
+def tokenized_https_url(url: str, username: str, token: str) -> str:
+    if not username or not token:
+        return url
+    if not url.startswith("https://"):
+        raise SystemExit("Only HTTPS remotes are supported for embedded token auth.")
+    rest = url[len("https://"):]
+    return f"https://{username}:{token}@{rest}"
+
+
+def build_git_env() -> Dict[str, str]:
+    return os.environ.copy()
+
+
+def build_codex_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    if OPENAI_API_KEY:
+        env["OPENAI_API_KEY"] = OPENAI_API_KEY
+    return env
+
+
+# =============================================================================
+# IGNORE / FILTERING
+# =============================================================================
+
+def path_matches_glob(relpath: str) -> bool:
+    relpath = relpath.replace("\\", "/")
+    for pat in IGNORE_GLOBS:
+        if fnmatch.fnmatch(relpath, pat):
+            return True
+        parts = relpath.split("/")
+        for i in range(len(parts)):
+            sub = "/".join(parts[i:])
+            if fnmatch.fnmatch(sub, pat):
+                return True
+    return False
+
+
+def git_ignored_paths(repo: Path, relpaths: List[str]) -> set[str]:
+    if not relpaths:
+        return set()
+
+    ignored: set[str] = set()
+    chunk_size = 200
+    for i in range(0, len(relpaths), chunk_size):
+        chunk = relpaths[i:i + chunk_size]
+        proc = subprocess.run(
+            ["git", "check-ignore", "--stdin"],
+            cwd=str(repo),
+            input="\n".join(chunk),
+            text=True,
+            capture_output=True,
+        )
+        if proc.returncode in (0, 1):
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    ignored.add(line)
+    return ignored
+
+
+def should_ignore_path(repo: Path, relpath: str, git_ignored: Optional[set[str]] = None) -> bool:
+    relpath = relpath.replace("\\", "/")
+    if path_matches_glob(relpath):
+        return True
+    if git_ignored is not None and relpath in git_ignored:
+        return True
+    return False
+
+
+# =============================================================================
+# STATIC IDLE PANEL + PROMPTS
+# =============================================================================
+
+class IdleMatrixPanel:
+    """
+    Static matrix-style panel shown before input() starts.
+    It stays visible while the user types, but does not animate.
+    """
+
+    def __init__(self, repo: Path) -> None:
+        self.repo = repo
+        self._rng = random.Random()
+        self._last_line_count = 0
+        self._enabled = supports_ansi()
+
+    def _move_up(self, n: int) -> None:
+        if n > 0:
+            sys.stdout.write(f"\033[{n}A")
+
+    def clear(self) -> None:
+        if not self._enabled or self._last_line_count <= 0:
+            return
+        self._move_up(self._last_line_count)
+        for i in range(self._last_line_count):
+            sys.stdout.write("\r\033[2K")
+            if i < self._last_line_count - 1:
+                sys.stdout.write("\n")
+        if self._last_line_count > 1:
+            self._move_up(self._last_line_count - 1)
+        sys.stdout.write("\r")
+        sys.stdout.flush()
+        self._last_line_count = 0
+
+    def _render_lines(self) -> List[str]:
+        width = 34
+        height = 5
+        scan = self._rng.randrange(width)
+
+        body: List[str] = []
+        for _y in range(height):
+            row = []
+            for x in range(width):
+                ch = " "
+                if x == scan:
+                    ch = "│"
+                elif x == (scan - 1) % width:
+                    ch = "·"
+                elif self._rng.random() < 0.05:
+                    ch = self._rng.choice([".", "·", "+", "*"])
+                row.append(ch)
+
+            rendered = []
+            for ch in row:
+                if ch == "│":
+                    rendered.append(c(ch, CYAN))
+                elif ch in {"+", "*"}:
+                    rendered.append(c(ch, GREEN))
+                elif ch in {".", "·"}:
+                    rendered.append(c(ch, DIM))
+                else:
+                    rendered.append(ch)
+            body.append("".join(rendered))
+
+        repo_name = self.repo.name
+        top = c(f"╔{'═' * width}╗", DIM)
+        bottom = c(f"╚{'═' * width}╝", DIM)
+        title = f"{BOLD}{GREEN} MATRIX IDLE {RESET}{DIM}repo={repo_name}{RESET}"
+        footer = c(" waiting for prompt :: type task or quit ", DIM)
+
+        return [title, top] + [f"║{line}║" for line in body] + [bottom, footer]
+
+    def paint(self) -> None:
+        if not self._enabled:
+            return
+        lines = self._render_lines()
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        self._last_line_count = len(lines)
+
+
+def idle_prompt_line(label: str, repo: Path) -> str:
+    panel: Optional[IdleMatrixPanel] = None
+    try:
+        if supports_ansi():
+            panel = IdleMatrixPanel(repo)
+            panel.paint()
+            print()
+        return input(label)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "quit"
+    finally:
+        if panel is not None:
+            panel.clear()
+
+
+def idle_prompt_multiline(label: str, repo: Path) -> str:
+    """
+    Multiline prompt for Codex tasks.
+
+    Submit rule:
+    - 4 consecutive blank lines submits the prompt.
+    - Regular Enter inserts a newline.
+    """
+    panel: Optional[IdleMatrixPanel] = None
+    try:
+        if supports_ansi():
+            panel = IdleMatrixPanel(repo)
+            panel.paint()
+            print()
+
+        print(label, end="", flush=True)
+        print("(finish with 4 blank lines)", flush=True)
+
+        lines: List[str] = []
+        blank_streak = 0
+
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                if not lines:
+                    print()
+                    return "quit"
+                break
+            except KeyboardInterrupt:
+                print()
+                return "quit"
+
+            if line == "":
+                blank_streak += 1
+            else:
+                blank_streak = 0
+
+            lines.append(line)
+
+            if blank_streak >= 4:
+                lines = lines[:-4]
+                break
+
+        while lines and lines[-1] == "":
+            lines.pop()
+
+        return "\n".join(lines)
+
+    finally:
+        if panel is not None:
+            panel.clear()
+
+
+# =============================================================================
+# RUN STATUS ANIMATION
+# =============================================================================
+
+class LiveStatus:
+    """
+    Multi-line terminal animation with reduced flicker.
+    """
+
+    def __init__(self, label: str = "Codex is thinking", mode: str = "radar") -> None:
+        self.label = label
+        self.mode = mode
+        self._stop = threading.Event()
+        self._pause = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._start_time = 0.0
+        self._lock = threading.Lock()
+        self._tick = 0
+        self._rng = random.Random()
+        self._last_lines: List[str] = []
+        self._drawn_once = False
+        self._spinner_frames = ["|", "/", "-", "\\"]
+
+    def start(self) -> None:
+        self._start_time = time.time()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _move_up(self, n: int) -> None:
+        if n > 0:
+            sys.stdout.write(f"\033[{n}A")
+
+    def _paint(self, lines: List[str]) -> None:
+        if not self._drawn_once:
+            sys.stdout.write("\n".join(lines))
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._last_lines = lines[:]
+            self._drawn_once = True
+            return
+
+        self._move_up(len(self._last_lines))
+        max_lines = max(len(self._last_lines), len(lines))
+        padded_new = lines + [""] * (max_lines - len(lines))
+        padded_old = self._last_lines + [""] * (max_lines - len(self._last_lines))
+
+        for i, (_old, new) in enumerate(zip(padded_old, padded_new)):
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.write(new)
+            if i < max_lines - 1:
+                sys.stdout.write("\n")
+
+        sys.stdout.flush()
+        self._last_lines = lines[:]
+
+    def _final_clear(self) -> None:
+        if not self._drawn_once:
+            return
+
+        self._move_up(len(self._last_lines))
+        for i in range(len(self._last_lines)):
+            sys.stdout.write("\r\033[2K")
+            if i < len(self._last_lines) - 1:
+                sys.stdout.write("\n")
+        if self._last_lines:
+            self._move_up(len(self._last_lines) - 1)
+            sys.stdout.write("\r")
+        sys.stdout.flush()
+
+        self._last_lines = []
+        self._drawn_once = False
+
+    def _render_lines(self) -> List[str]:
+        elapsed = time.time() - self._start_time
+        if not supports_ansi() or self.mode == "spinner":
+            return self._render_spinner(elapsed)
+        return self._render_radar(elapsed)
+
+    def _render_spinner(self, elapsed: float) -> List[str]:
+        frame = self._spinner_frames[self._tick % len(self._spinner_frames)]
+        return [f"{DIM}{frame} {self.label}... {elapsed:5.1f}s{RESET}"]
+
+    def _render_radar(self, elapsed: float) -> List[str]:
+        width = RADAR_WIDTH
+        height = RADAR_HEIGHT
+        sweep_x = self._tick % width
+        pulse_y = (self._tick // 2) % height
+
+        chars: List[List[str]] = []
+        for y in range(height):
+            row: List[str] = []
+            for x in range(width):
+                ch = " "
+                if x == sweep_x:
+                    ch = "│"
+                elif x == (sweep_x - 1) % width:
+                    ch = "·"
+                elif x == (sweep_x - 2) % width:
+                    ch = "."
+                if self._rng.random() < 0.018:
+                    ch = self._rng.choice(["·", ".", "*", "+"])
+                if y == pulse_y and self._rng.random() < 0.22:
+                    ch = "•"
+                row.append(ch)
+            chars.append(row)
+
+        for i in range(3):
+            cx = (sweep_x + 7 * i + 5) % width
+            cy = (pulse_y + 2 * i + 1) % height
+            for dy, dx, mark in [(0, 0, "◉"), (0, 1, "•"), (1, 0, "•")]:
+                yy = cy + dy
+                xx = cx + dx
+                if 0 <= yy < height and 0 <= xx < width:
+                    chars[yy][xx] = mark
+
+        body = []
+        for row in chars:
+            rendered = []
+            for ch in row:
+                if ch in {"◉", "•", "*", "+"}:
+                    rendered.append(c(ch, GREEN))
+                elif ch == "│":
+                    rendered.append(c(ch, CYAN))
+                elif ch in {"·", "."}:
+                    rendered.append(c(ch, DIM))
+                else:
+                    rendered.append(ch)
+            body.append("".join(rendered))
+
+        status_a = f"model={CODEX_MODEL}"
+        status_b = f"t={elapsed:5.1f}s"
+        status_c = f"mode={CODEX_SANDBOX}"
+
+        top = f"┌{'─' * width}┐"
+        bottom = f"└{'─' * width}┘"
+        title = f"{BOLD}{CYAN} {self.label}{RESET}"
+        meta = f"{DIM}{status_a}  {status_b}  {status_c}{RESET}"
+
+        rendered = [title, meta, top]
+        for line in body:
+            rendered.append("│" + line + "│")
+        rendered.append(bottom)
+        rendered.append(c(" scanning repo state / diff lattice / patch vectors ", DIM))
+        return rendered
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if self._pause.is_set():
+                time.sleep(0.02)
+                continue
+
+            lines = self._render_lines()
+            with self._lock:
+                self._paint(lines)
+
+            self._tick += 1
+            time.sleep(RADAR_INTERVAL if self.mode == "radar" else SPINNER_INTERVAL)
+
+        with self._lock:
+            self._final_clear()
+
+    def pause_for_output(self) -> None:
+        self._pause.set()
+        with self._lock:
+            self._final_clear()
+
+    def resume(self) -> None:
+        self._pause.clear()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+
+
+# =============================================================================
+# CODEX CAPABILITY DETECTION
+# =============================================================================
+
+def detect_codex_support() -> CodexSupport:
+    proc = run_cmd([CODEX_BINARY, "exec", "--help"], check=False, capture=True)
+    text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    return CodexSupport(
+        has_json="--json" in text,
+        has_output_last_message="--output-last-message" in text,
+        has_search="--search" in text,
+    )
+
+
+def build_codex_command(
+    support: CodexSupport,
+    prompt_text: str,
+    summary_file: Path,
+) -> List[str]:
+    cmd = [
+        CODEX_BINARY,
+        "exec", "--skip-git-repo-check",
+        "--model", CODEX_MODEL,
+        "--sandbox", CODEX_SANDBOX,
+    ]
+
+    if CODEX_USE_JSON_IF_AVAILABLE and support.has_json:
+        cmd.append("--json")
+
+    if CODEX_ENABLE_WEB_SEARCH and support.has_search:
+        cmd.append("--search")
+
+    if support.has_output_last_message:
+        cmd += ["--output-last-message", str(summary_file)]
+
+    full_prompt = (
+        prompt_text.strip()
+        + "\n\n"
+        + textwrap.dedent(CODEX_EXTRA_SUFFIX).strip()
+        + "\n"
+    )
+    cmd.append(full_prompt)
+    return cmd
+
+
+# =============================================================================
+# SNAPSHOT / TEMP REPO
+# =============================================================================
+
+def make_temp_snapshot(repo: Path) -> Tuple[Path, Path, Path]:
+    repo = repo.resolve()
+    temp_root = Path(tempfile.mkdtemp(prefix="codex-run-")).resolve()
+    snapshot = (temp_root / "snapshot").resolve()
+    working = (temp_root / "working").resolve()
+    snapshot.mkdir(parents=True, exist_ok=True)
+
+    archive_path = (temp_root / "repo.tar").resolve()
+    with archive_path.open("wb") as f:
+        proc = subprocess.run(
+            ["git", "archive", "--format=tar", "HEAD"],
+            cwd=str(repo),
+            stdout=f,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            raise CommandError(f"git archive failed:\n{proc.stderr.decode()}")
+
+    run_cmd(["tar", "-xf", str(archive_path), "-C", str(snapshot)])
+    shutil.copytree(snapshot, working, dirs_exist_ok=False)
+    return temp_root, snapshot, working
+
+
+def cleanup_temp_dir(temp_root: Path) -> None:
+    shutil.rmtree(temp_root, ignore_errors=True)
+
+
+# =============================================================================
+# FILE DIFFING
+# =============================================================================
+
+def list_files_recursive(root: Path) -> Dict[str, Path]:
+    result: Dict[str, Path] = {}
+    for p in root.rglob("*"):
+        if p.is_file():
+            rel = str(p.relative_to(root)).replace("\\", "/")
+            result[rel] = p
+    return result
+
+
+def compute_changed_files(repo: Path, snapshot_dir: Path, working_dir: Path) -> List[ChangedFile]:
+    old_map = list_files_recursive(snapshot_dir)
+    new_map = list_files_recursive(working_dir)
+    all_paths = sorted(set(old_map) | set(new_map))
+    git_ignored = git_ignored_paths(repo, all_paths)
+
+    changed: List[ChangedFile] = []
+
+    for rel in all_paths:
+        if should_ignore_path(repo, rel, git_ignored):
+            continue
+
+        old_p = old_map.get(rel)
+        new_p = new_map.get(rel)
+
+        if old_p and not new_p:
+            changed.append(ChangedFile(rel, "D", old_p, None))
+            continue
+        if new_p and not old_p:
+            changed.append(ChangedFile(rel, "A", None, new_p))
+            continue
+
+        assert old_p is not None and new_p is not None
+        if old_p.read_bytes() != new_p.read_bytes():
+            changed.append(ChangedFile(rel, "M", old_p, new_p))
+
+    return changed
+
+
+def is_binary_file(path: Path) -> bool:
+    try:
+        data = path.read_bytes()[:8192]
+    except Exception:
+        return True
+    return b"\x00" in data
+
+
+def _safe_read_lines(path: Optional[Path]) -> List[str]:
+    if path is None:
+        return []
+    if is_binary_file(path):
+        return ["<binary file>\n"]
+    return path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+
+
+def colorize_diff_line(line: str) -> str:
+    if line.startswith("--- ") or line.startswith("+++ "):
+        return c(line.rstrip("\n"), BOLD)
+    if line.startswith("@@"):
+        return c(line.rstrip("\n"), CYAN)
+    if line.startswith("+") and not line.startswith("+++ "):
+        return c(line.rstrip("\n"), GREEN)
+    if line.startswith("-") and not line.startswith("--- "):
+        return c(line.rstrip("\n"), RED)
+    return line.rstrip("\n")
+
+
+def render_diff(ch: ChangedFile) -> str:
+    old_lines = _safe_read_lines(ch.old_abs)
+    new_lines = _safe_read_lines(ch.new_abs)
+
+    diff = difflib.unified_diff(
+        old_lines,
+        new_lines,
+        fromfile=f"a/{ch.path}",
+        tofile=f"b/{ch.path}",
+        lineterm="",
+    )
+    lines = list(diff)
+    if not lines:
+        return "(no textual diff available)"
+    return "\n".join(colorize_diff_line(line) for line in lines)
+
+
+# =============================================================================
+# CODEX EXECUTION
+# =============================================================================
+
+def extract_summary_from_stream(text: str) -> str:
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+    if not blocks:
+        return "(No summary captured.)"
+
+    for block in reversed(blocks):
+        stripped = block.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            continue
+        return stripped
+
+    return blocks[-1]
+
+
+def run_codex(
+    support: CodexSupport,
+    working_dir: Path,
+    prompt_text: str,
+) -> Tuple[str, str]:
+    summary_file = (working_dir.parent / "last_message.txt").resolve()
+    cmd = build_codex_command(support, prompt_text, summary_file)
+
+    banner("RUNNING CODEX")
+    print("Command:")
+    print(" ".join(shlex.quote(x) for x in cmd[:-1]))
+    print("\nPrompt:")
+    print(prompt_text)
+    print("\nOutput:")
+    print("-" * 88)
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(working_dir),
+        env=build_codex_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    live = LiveStatus("Codex is thinking", mode="radar")
+    live.start()
+
+    out_lines: List[str] = []
+    assert proc.stdout is not None
+    rc = 0
+
+    try:
+        for line in proc.stdout:
+            out_lines.append(line)
+            if SHOW_FULL_CODEX_STREAM:
+                live.pause_for_output()
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                live.resume()
+        rc = proc.wait()
+    finally:
+        live.stop()
+
+    print("-" * 88)
+
+    combined = "".join(out_lines)
+    if rc != 0:
+        raise CommandError(f"Codex failed with exit code {rc}\n{combined}")
+
+    if summary_file.exists():
+        summary = summary_file.read_text(encoding="utf-8", errors="replace").strip()
+    else:
+        summary = extract_summary_from_stream(combined)
+
+    if not summary:
+        summary = "(No summary captured.)"
+
+    return summary, combined
+
+
+# =============================================================================
+# APPLY BACK TO REAL REPO
+# =============================================================================
+
+def ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def copy_changed_file_into_repo(repo: Path, ch: ChangedFile) -> None:
+    dest = (repo.resolve() / ch.path).resolve()
+
+    if ch.status == "D":
+        if dest.exists():
+            dest.unlink()
+        return
+
+    assert ch.new_abs is not None
+    ensure_parent(dest)
+    shutil.copy2(ch.new_abs.resolve(), dest)
+
+
+def stage_paths(repo: Path, paths: List[str]) -> None:
+    run_cmd(["git", "add", "--"] + paths, cwd=repo)
+
+
+def stage_all(repo: Path) -> None:
+    run_cmd(["git", "add", "-A"], cwd=repo)
+
+
+def commit(repo: Path, message: str) -> None:
+    run_cmd(["git", "commit", "-m", message], cwd=repo)
+
+
+def push_branch(repo: Path, branch: str) -> None:
+    remote_url = git_remote_url(repo, GIT_REMOTE_NAME)
+    push_url = tokenized_https_url(remote_url, GIT_REMOTE_USERNAME, GIT_REMOTE_TOKEN)
+    run_cmd(["git", "push", push_url, f"HEAD:{branch}"], cwd=repo, env=build_git_env())
+
+
+def make_commit_message(prompt_text: str, summary: str, ch: Optional[ChangedFile] = None) -> str:
+    if ch:
+        return f"{COMMIT_PREFIX}: update {ch.path}"
+    first = summary.strip().splitlines()[0] if summary.strip() else prompt_text.strip()
+    return f"{COMMIT_PREFIX}: {first[:72]}"
+
+
+def apply_result(repo: Path, result: RunResult) -> None:
+    branch = get_current_branch(repo)
+
+    if COMMIT_MODE == "single":
+        for ch in result.changed_files:
+            copy_changed_file_into_repo(repo, ch)
+        stage_all(repo)
+        commit(repo, make_commit_message(result.prompt, result.summary))
+        push_branch(repo, branch)
+        ok(f"Pushed 1 commit to {GIT_REMOTE_NAME}/{branch}")
+        return
+
+    for idx, ch in enumerate(result.changed_files, start=1):
+        info(f"[{idx}/{len(result.changed_files)}] Applying {ch.path}")
+        copy_changed_file_into_repo(repo, ch)
+        stage_paths(repo, [ch.path])
+        commit(repo, make_commit_message(result.prompt, result.summary, ch))
+        push_branch(repo, branch)
+
+    ok(f"Pushed {len(result.changed_files)} commit(s) to {GIT_REMOTE_NAME}/{branch}")
+
+
+# =============================================================================
+# MENUS
+# =============================================================================
+
+def print_summary(result: RunResult) -> None:
+    banner("CHANGE SUMMARY")
+    print(result.summary)
+
+    banner("CHANGED FILES")
+    if not result.changed_files:
+        print("(No non-ignored file changes detected.)")
+        return
+
+    for idx, ch in enumerate(result.changed_files, start=1):
+        label = {
+            "A": c("A", GREEN),
+            "M": c("M", YELLOW),
+            "D": c("D", RED),
+        }.get(ch.status, ch.status)
+
+        path_display = ch.path
+        if len(path_display) > MAX_FILE_LIST_WIDTH:
+            path_display = "..." + path_display[-(MAX_FILE_LIST_WIDTH - 3):]
+
+        print(f"{idx:>3}. [{label}] {path_display}")
+
+
+def inspect_loop(result: RunResult, repo: Path) -> None:
+    if not result.changed_files:
+        warn("Nothing to inspect.")
+        return
+
+    while True:
+        banner("INSPECT")
+        for idx, ch in enumerate(result.changed_files, start=1):
+            print(f"{idx:>3}. [{ch.status}] {ch.path}")
+
+        choice = idle_prompt_line("\nFile number to inspect, or Enter to go back: ", repo).strip()
+        if choice == "":
+            return
+        if not choice.isdigit():
+            warn("Please enter a valid number.")
+            continue
+
+        n = int(choice)
+        if not (1 <= n <= len(result.changed_files)):
+            warn("Out of range.")
+            continue
+
+        ch = result.changed_files[n - 1]
+        banner(f"DIFF: {ch.path}")
+        print(render_diff(ch))
+        idle_prompt_line("\nPress Enter to return to inspect menu... ", repo)
+
+
+def decision_loop(repo: Path, result: RunResult) -> None:
+    while True:
+        banner("DECISION")
+        choice = idle_prompt_line("[a]pply / [r]eject / [i]nspect: ", repo).strip().lower()
+
+        if choice in {"i", "inspect"}:
+            inspect_loop(result, repo)
+            continue
+
+        if choice in {"r", "reject"}:
+            warn("Rejected. Discarding changes.")
+            return
+
+        if choice in {"a", "apply"}:
+            if not result.changed_files:
+                warn("No changes to apply.")
+                return
+            apply_result(repo, result)
+            return
+
+        warn("Please choose apply, reject, or inspect.")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main() -> int:
+    ensure_binary("git")
+    ensure_binary("tar")
+    ensure_binary(CODEX_BINARY)
+
+    support = detect_codex_support()
+    repo = get_repo_root().resolve()
+    invocation_cwd = Path.cwd().resolve()
+
+    banner("CODEX LOOP")
+    print(f"Script: {SCRIPT_PATH}")
+    print(f"CWD:    {invocation_cwd}")
+    print(f"Repo:   {repo}")
+    print(f"Model:  {CODEX_MODEL}")
+    print(f"Remote: {GIT_REMOTE_NAME}")
+    print(f"Commit: {COMMIT_MODE}")
+    print(
+        f"Codex support: json={support.has_json}, "
+        f"output-last-message={support.has_output_last_message}, "
+        f"search={support.has_search}"
+    )
+    print("\nType quit or exit to stop.")
+
+    while True:
+        user_prompt = idle_prompt_multiline("\ncodex> ", repo).strip()
+        if user_prompt.lower() in {"quit", "exit"}:
+            print("Bye.")
+            return 0
+        if not user_prompt:
+            continue
+
+        ensure_clean_repo(repo)
+
+        temp_root: Optional[Path] = None
+        try:
+            temp_root, snapshot_dir, working_dir = make_temp_snapshot(repo)
+            summary, _combined = run_codex(support, working_dir, user_prompt)
+            changed_files = compute_changed_files(repo, snapshot_dir, working_dir)
+
+            result = RunResult(
+                prompt=user_prompt,
+                summary=summary,
+                changed_files=changed_files,
+                temp_root=temp_root,
+                snapshot_dir=snapshot_dir,
+                working_dir=working_dir,
+            )
+
+            print_summary(result)
+            decision_loop(repo, result)
+
+        except CommandError as e:
+            banner("ERROR")
+            err(str(e))
+        except Exception as e:
+            banner("UNEXPECTED ERROR")
+            err(repr(e))
+        finally:
+            if temp_root is not None:
+                cleanup_temp_dir(temp_root)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
