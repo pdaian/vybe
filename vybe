@@ -162,6 +162,11 @@ CYAN = "\033[36m"
 WHITE = "\033[37m"
 
 ART_COLORS = [RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, WHITE]
+ART_SPARK_GLYPHS = [".", "·", "+", "*"]
+ART_ALNUM_GLYPHS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+ART_SYMBOL_GLYPHS = ["§", "±", "×", "÷", "∆", "∞", "◇", "◆", "○", "●", "◌", "◍"]
+ART_EMOJI_GLYPHS = ["✨", "⚡", "🌙", "🪐"]
+ART_BRIGHT_GLYPHS = set(ART_ALNUM_GLYPHS) | set(ART_SYMBOL_GLYPHS) | set(ART_EMOJI_GLYPHS) | {"+", "*"}
 
 # =============================================================================
 # DATA TYPES
@@ -210,6 +215,17 @@ def c(text: str, color: str) -> str:
 
 def art_color(seed: int, palette: Sequence[str] = ART_COLORS) -> str:
     return palette[seed % len(palette)]
+
+
+def art_noise_glyph(rng: random.Random) -> str:
+    roll = rng.random()
+    if roll < 0.72:
+        return rng.choice(ART_SPARK_GLYPHS)
+    if roll < 0.88:
+        return rng.choice(ART_ALNUM_GLYPHS)
+    if roll < 0.97:
+        return rng.choice(ART_SYMBOL_GLYPHS)
+    return rng.choice(ART_EMOJI_GLYPHS)
 
 
 def banner(title: str) -> None:
@@ -469,14 +485,14 @@ class IdleMatrixPanel:
                 elif x == (scan - 1) % width:
                     ch = "·"
                 elif self._rng.random() < 0.05:
-                    ch = self._rng.choice([".", "·", "+", "*"])
+                    ch = art_noise_glyph(self._rng)
                 row.append(ch)
 
             rendered = []
             for x, ch in enumerate(row):
                 if ch == "│":
                     rendered.append(c(ch, art_color(scan + x)))
-                elif ch in {"+", "*"}:
+                elif ch in ART_BRIGHT_GLYPHS:
                     rendered.append(c(ch, art_color(scan * 3 + x)))
                 elif ch in {".", "·"}:
                     if self._rng.random() < 0.35:
@@ -710,6 +726,8 @@ class LiveStatus:
                     ch = "─"
                 if y == (pulse_y + (x // 6)) % height and (x + self._tick) % 9 == 0:
                     ch = "•"
+                if ch in {"✦", "*", "•"} and (x + y + self._tick) % 23 == 0:
+                    ch = art_noise_glyph(self._rng)
                 row.append(ch)
             chars.append(row)
 
@@ -729,7 +747,7 @@ class LiveStatus:
                 seed = x * 11 + y * 17 + self._tick * 3
                 if ch in {"◉", "✦"}:
                     rendered.append(c(ch, art_color(seed)))
-                elif ch in {"•", "*", "+"}:
+                elif ch in {"•", "*", "+"} or ch in ART_BRIGHT_GLYPHS:
                     rendered.append(c(ch, art_color(seed + 1)))
                 elif ch in {"│", "╎", "─"}:
                     rendered.append(c(ch, art_color(seed + 2)))
@@ -1124,6 +1142,14 @@ def branch_has_upstream(repo: Path, branch: str, remote_name: str) -> bool:
     return proc.stdout.strip() == f"{remote_name}/{branch}"
 
 
+def sync_remote_tracking_branch(repo: Path, remote_name: str, branch: str, target_ref: str = "HEAD") -> None:
+    run_cmd(
+        ["git", "update-ref", f"refs/remotes/{remote_name}/{branch}", target_ref],
+        cwd=repo,
+        env=build_git_env(),
+    )
+
+
 def push_branch(repo: Path, branch: str) -> None:
     if not has_remote(repo, GIT_REMOTE_NAME):
         raise SystemExit(f"Git remote {GIT_REMOTE_NAME!r} is not configured.")
@@ -1134,6 +1160,7 @@ def push_branch(repo: Path, branch: str) -> None:
     if username and token and remote_url.startswith("https://"):
         push_target = tokenized_https_url(remote_url, username, token)
         run_cmd(["git", "push", push_target, f"HEAD:refs/heads/{branch}"], cwd=repo, env=build_git_env())
+        sync_remote_tracking_branch(repo, GIT_REMOTE_NAME, branch)
         if not has_expected_upstream:
             run_cmd(
                 ["git", "branch", f"--set-upstream-to={GIT_REMOTE_NAME}/{branch}", branch],
