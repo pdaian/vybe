@@ -298,6 +298,12 @@ def git_remote_url(repo: Path, remote_name: str) -> str:
     return proc.stdout.strip()
 
 
+def has_remote(repo: Path, remote_name: str) -> bool:
+    proc = run_cmd(["git", "remote"], cwd=repo)
+    remotes = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    return remote_name in remotes
+
+
 def tokenized_https_url(url: str, username: str, token: str) -> str:
     if not username or not token:
         return url
@@ -1091,18 +1097,112 @@ def commit(repo: Path, message: str) -> None:
     run_cmd(["git", "commit", "-m", message], cwd=repo)
 
 
+def branch_has_upstream(repo: Path, branch: str, remote_name: str) -> bool:
+    proc = run_cmd(
+        ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        cwd=repo,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return False
+    return proc.stdout.strip() == f"{remote_name}/{branch}"
+
+
 def push_branch(repo: Path, branch: str) -> None:
+    if not has_remote(repo, GIT_REMOTE_NAME):
+        raise SystemExit(f"Git remote {GIT_REMOTE_NAME!r} is not configured.")
+
+    has_expected_upstream = branch_has_upstream(repo, branch, GIT_REMOTE_NAME)
     remote_url = git_remote_url(repo, GIT_REMOTE_NAME)
     username, token = resolve_git_remote_credentials()
-    push_url = tokenized_https_url(remote_url, username, token)
-    run_cmd(["git", "push", push_url, f"HEAD:{branch}"], cwd=repo, env=build_git_env())
+    if username and token and remote_url.startswith("https://"):
+        push_target = tokenized_https_url(remote_url, username, token)
+        run_cmd(["git", "push", push_target, f"HEAD:refs/heads/{branch}"], cwd=repo, env=build_git_env())
+        if not has_expected_upstream:
+            run_cmd(
+                ["git", "branch", f"--set-upstream-to={GIT_REMOTE_NAME}/{branch}", branch],
+                cwd=repo,
+                env=build_git_env(),
+            )
+    else:
+        args = ["git", "push"]
+        if not has_expected_upstream:
+            args += ["--set-upstream", GIT_REMOTE_NAME, f"HEAD:refs/heads/{branch}"]
+        else:
+            args += [GIT_REMOTE_NAME, "HEAD"]
+        run_cmd(args, cwd=repo, env=build_git_env())
 
 
-def make_commit_message(prompt_text: str, summary: str, ch: Optional[ChangedFile] = None) -> str:
+GENERIC_COMMIT_SUBJECTS = {
+    "",
+    "(no summary captured.)",
+    "changes applied",
+    "completed",
+    "done",
+    "fix",
+    "fixed",
+    "snapshot",
+    "update",
+    "updated",
+}
+
+
+def clean_commit_subject(text: str) -> str:
+    line = text.strip()
+    if not line:
+        return ""
+    line = re.sub(r"^[\-\*\d\.\)\s]+", "", line)
+    line = re.sub(r"^(summary|result|changes?|updated?|implemented?)\s*:\s*", "", line, flags=re.I)
+    line = re.sub(r"\s+", " ", line).strip(" .:-")
+    return line
+
+
+def extract_commit_subject(*texts: str) -> str:
+    for text in texts:
+        for raw_line in text.splitlines():
+            subject = clean_commit_subject(raw_line)
+            if not subject:
+                continue
+            if subject.lower() in GENERIC_COMMIT_SUBJECTS:
+                continue
+            return subject
+    return ""
+
+
+def clip_commit_subject(subject: str) -> str:
+    max_len = max(20, 72 - len(COMMIT_PREFIX) - 2)
+    subject = subject.strip()
+    if len(subject) <= max_len:
+        return subject
+    return subject[: max_len - 3].rstrip() + "..."
+
+
+def fallback_commit_subject(changed_files: Optional[List[ChangedFile]] = None) -> str:
+    files = changed_files or []
+    if len(files) == 1:
+        ch = files[0]
+        verb = {
+            "A": "add",
+            "D": "remove",
+            "M": "update",
+        }.get(ch.status, "update")
+        return f"{verb} {ch.path}"
+    return "apply requested changes"
+
+
+def make_commit_message(
+    prompt_text: str,
+    summary: str,
+    ch: Optional[ChangedFile] = None,
+    changed_files: Optional[List[ChangedFile]] = None,
+) -> str:
     if ch:
-        return f"{COMMIT_PREFIX}: update {ch.path}"
-    first = summary.strip().splitlines()[0] if summary.strip() else prompt_text.strip()
-    return f"{COMMIT_PREFIX}: {first[:72]}"
+        return f"{COMMIT_PREFIX}: {fallback_commit_subject([ch])}"
+
+    subject = extract_commit_subject(summary, prompt_text)
+    if not subject:
+        subject = fallback_commit_subject(changed_files)
+    return f"{COMMIT_PREFIX}: {clip_commit_subject(subject)}"
 
 
 def apply_result(repo: Path, result: RunResult) -> None:
@@ -1112,7 +1212,7 @@ def apply_result(repo: Path, result: RunResult) -> None:
         for ch in result.changed_files:
             copy_changed_file_into_repo(repo, ch)
         stage_all(repo)
-        commit(repo, make_commit_message(result.prompt, result.summary))
+        commit(repo, make_commit_message(result.prompt, result.summary, changed_files=result.changed_files))
         push_branch(repo, branch)
         ok(f"Pushed 1 commit to {GIT_REMOTE_NAME}/{branch}")
         return
