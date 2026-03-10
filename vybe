@@ -76,8 +76,10 @@ GIT_REMOTE_TOKEN = ""
 #   line 1: GitHub username
 #   line 2: GitHub PAT/token
 GITHUB_PAT_FILE = Path.home() / "github.pat"
-COMMIT_MODE = "per-file"   # "per-file" or "single"
+COMMIT_MODE = "single"   # "per-file" or "single"
 COMMIT_PREFIX = "codex"
+TEMP_GIT_USER_NAME = "vybe"
+TEMP_GIT_USER_EMAIL = "vybe@local"
 
 SHOW_FULL_CODEX_STREAM = True
 MAX_FILE_LIST_WIDTH = 120
@@ -319,6 +321,15 @@ def resolve_git_remote_credentials() -> Tuple[str, str]:
 
 def build_git_env() -> Dict[str, str]:
     return os.environ.copy()
+
+
+def build_temp_git_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    env["GIT_AUTHOR_NAME"] = TEMP_GIT_USER_NAME
+    env["GIT_AUTHOR_EMAIL"] = TEMP_GIT_USER_EMAIL
+    env["GIT_COMMITTER_NAME"] = TEMP_GIT_USER_NAME
+    env["GIT_COMMITTER_EMAIL"] = TEMP_GIT_USER_EMAIL
+    return env
 
 
 def build_codex_env() -> Dict[str, str]:
@@ -794,11 +805,19 @@ def make_temp_snapshot(repo: Path) -> Tuple[Path, Path, Path]:
 
     run_cmd(["tar", "-xf", str(archive_path), "-C", str(snapshot)])
     shutil.copytree(snapshot, working, dirs_exist_ok=False)
+    init_temp_git_repo(working)
     return temp_root, snapshot, working
 
 
 def cleanup_temp_dir(temp_root: Path) -> None:
     shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def init_temp_git_repo(working_dir: Path) -> None:
+    git_env = build_temp_git_env()
+    run_cmd(["git", "init"], cwd=working_dir, env=git_env)
+    run_cmd(["git", "add", "-A"], cwd=working_dir, env=git_env)
+    run_cmd(["git", "commit", "--allow-empty", "-m", "snapshot"], cwd=working_dir, env=git_env)
 
 
 # =============================================================================
@@ -814,40 +833,42 @@ def list_paths_recursive(root: Path) -> Dict[str, Path]:
     return result
 
 
+def git_status_entries(working_dir: Path) -> List[Tuple[str, str]]:
+    proc = run_cmd(
+        ["git", "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames"],
+        cwd=working_dir,
+    )
+    entries: List[Tuple[str, str]] = []
+    for raw in proc.stdout.split("\0"):
+        if not raw:
+            continue
+        status = raw[:2]
+        path = raw[3:].replace("\\", "/")
+        if path:
+            entries.append((status, path))
+    return entries
+
+
 def compute_changed_files(repo: Path, snapshot_dir: Path, working_dir: Path) -> List[ChangedFile]:
     old_map = list_paths_recursive(snapshot_dir)
     new_map = list_paths_recursive(working_dir)
-    all_paths = sorted(set(old_map) | set(new_map))
-    git_ignored = git_ignored_paths(repo, all_paths)
-
     changed: List[ChangedFile] = []
 
-    for rel in all_paths:
-        if should_ignore_path(repo, rel, git_ignored):
+    seen: set[str] = set()
+    for status, rel in git_status_entries(working_dir):
+        if rel in seen or should_ignore_path(repo, rel):
             continue
-
-        old_p = old_map.get(rel)
-        new_p = new_map.get(rel)
-
-        if old_p and not new_p:
-            changed.append(ChangedFile(rel, "D", old_p, None))
+        seen.add(rel)
+        if status == "??":
+            changed.append(ChangedFile(rel, "A", None, new_map.get(rel)))
             continue
-        if new_p and not old_p:
-            changed.append(ChangedFile(rel, "A", None, new_p))
+        if "D" in status:
+            changed.append(ChangedFile(rel, "D", old_map.get(rel), None))
             continue
-
-        assert old_p is not None and new_p is not None
-        if old_p.is_dir() and new_p.is_dir():
+        if "A" in status and rel not in old_map:
+            changed.append(ChangedFile(rel, "A", None, new_map.get(rel)))
             continue
-
-        if old_p.is_file() and new_p.is_file():
-            if old_p.read_bytes() != new_p.read_bytes():
-                changed.append(ChangedFile(rel, "M", old_p, new_p))
-            continue
-
-        # Type changed at the same path (file <-> directory).
-        if old_p.is_dir() != new_p.is_dir():
-            changed.append(ChangedFile(rel, "M", old_p, new_p))
+        changed.append(ChangedFile(rel, "M", old_map.get(rel), new_map.get(rel)))
 
     return changed
 
