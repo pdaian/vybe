@@ -41,6 +41,26 @@ Write the task. For multiline input, end with 4 blank lines.
 
 The tool snapshots the repo, sends the task to `codex`, then lets you inspect and decide what lands.
 
+## Customize vybe with vybe
+
+If `vybe` is in a git repo, you can use `vybe` to modify `vybe` itself.
+
+Example:
+
+```bash
+cd /path/to/vybe-repo
+vybe
+```
+
+Then give it a task such as:
+
+```text
+Update the status panel copy to be shorter.
+Keep the solution minimal and production-ready.
+```
+
+Review the generated diff, inspect any changed files, and apply only when the patch is correct.
+
 ## Notes
 
 - repo root is resolved from your current working directory
