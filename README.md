@@ -45,6 +45,8 @@ The tool snapshots the repo, sends the task to `codex`, then lets you inspect an
 
 - repo root is resolved from your current working directory
 - use a token or PAT for HTTPS git auth, not a password
+- git push auth can come from `GIT_REMOTE_USERNAME` / `GIT_REMOTE_TOKEN` in the script, or from `~/github.pat`
+- `~/github.pat` format: first line GitHub username, second line PAT/token
 - do not hardcode secrets into the script
 
 ## License
