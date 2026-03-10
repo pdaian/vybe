@@ -58,6 +58,7 @@ CODEX_MODEL = "gpt-5.4"
 CODEX_SANDBOX = "workspace-write"
 CODEX_ENABLE_WEB_SEARCH = False
 CODEX_USE_JSON_IF_AVAILABLE = True
+CODEX_MODE_ENV_VAR = "VYBE_CODEX_MODE"
 OPENAI_API_KEY = ""
 
 CODEX_EXTRA_SUFFIX = """
@@ -224,6 +225,13 @@ def supports_ansi() -> bool:
     return sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
 
 
+def clear_display() -> None:
+    if not supports_ansi():
+        return
+    sys.stdout.write("\033[H\033[2J")
+    sys.stdout.flush()
+
+
 def run_cmd(
     args: Sequence[str],
     *,
@@ -318,6 +326,22 @@ def build_codex_env() -> Dict[str, str]:
     if OPENAI_API_KEY:
         env["OPENAI_API_KEY"] = OPENAI_API_KEY
     return env
+
+
+def get_codex_mode() -> str:
+    raw = os.environ.get(CODEX_MODE_ENV_VAR, "fast").strip().lower()
+    aliases = {
+        "2x": "fast",
+        "fast": "fast",
+        "normal": "slow",
+        "slow": "slow",
+    }
+    mode = aliases.get(raw)
+    if mode is None:
+        raise SystemExit(
+            f"Invalid {CODEX_MODE_ENV_VAR}={raw!r}. Use fast, 2x, slow, or normal."
+        )
+    return mode
 
 
 # =============================================================================
@@ -714,12 +738,18 @@ def build_codex_command(
     prompt_text: str,
     summary_file: Path,
 ) -> List[str]:
+    codex_mode = get_codex_mode()
     cmd = [
         CODEX_BINARY,
         "exec", "--skip-git-repo-check",
         "--model", CODEX_MODEL,
         "--sandbox", CODEX_SANDBOX,
     ]
+
+    if codex_mode == "fast":
+        cmd += ["--enable", "fast_mode"]
+    else:
+        cmd += ["--disable", "fast_mode"]
 
     if CODEX_USE_JSON_IF_AVAILABLE and support.has_json:
         cmd.append("--json")
@@ -1128,6 +1158,7 @@ def main() -> int:
     ensure_binary(CODEX_BINARY)
 
     support = detect_codex_support()
+    codex_mode = get_codex_mode()
     repo = get_repo_root().resolve()
     invocation_cwd = Path.cwd().resolve()
 
@@ -1136,6 +1167,7 @@ def main() -> int:
     print(f"CWD:    {invocation_cwd}")
     print(f"Repo:   {repo}")
     print(f"Model:  {CODEX_MODEL}")
+    print(f"Mode:   {codex_mode}")
     print(f"Remote: {GIT_REMOTE_NAME}")
     print(f"Commit: {COMMIT_MODE}")
     print(
@@ -1170,6 +1202,7 @@ def main() -> int:
                 working_dir=working_dir,
             )
 
+            clear_display()
             print_summary(result)
             decision_loop(repo, result)
 
