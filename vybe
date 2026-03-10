@@ -775,18 +775,18 @@ def cleanup_temp_dir(temp_root: Path) -> None:
 # FILE DIFFING
 # =============================================================================
 
-def list_files_recursive(root: Path) -> Dict[str, Path]:
+def list_paths_recursive(root: Path) -> Dict[str, Path]:
     result: Dict[str, Path] = {}
     for p in root.rglob("*"):
-        if p.is_file():
+        if p.is_dir() or p.is_file():
             rel = str(p.relative_to(root)).replace("\\", "/")
             result[rel] = p
     return result
 
 
 def compute_changed_files(repo: Path, snapshot_dir: Path, working_dir: Path) -> List[ChangedFile]:
-    old_map = list_files_recursive(snapshot_dir)
-    new_map = list_files_recursive(working_dir)
+    old_map = list_paths_recursive(snapshot_dir)
+    new_map = list_paths_recursive(working_dir)
     all_paths = sorted(set(old_map) | set(new_map))
     git_ignored = git_ignored_paths(repo, all_paths)
 
@@ -807,7 +807,16 @@ def compute_changed_files(repo: Path, snapshot_dir: Path, working_dir: Path) -> 
             continue
 
         assert old_p is not None and new_p is not None
-        if old_p.read_bytes() != new_p.read_bytes():
+        if old_p.is_dir() and new_p.is_dir():
+            continue
+
+        if old_p.is_file() and new_p.is_file():
+            if old_p.read_bytes() != new_p.read_bytes():
+                changed.append(ChangedFile(rel, "M", old_p, new_p))
+            continue
+
+        # Type changed at the same path (file <-> directory).
+        if old_p.is_dir() != new_p.is_dir():
             changed.append(ChangedFile(rel, "M", old_p, new_p))
 
     return changed
@@ -842,6 +851,13 @@ def colorize_diff_line(line: str) -> str:
 
 
 def render_diff(ch: ChangedFile) -> str:
+    if (ch.old_abs and ch.old_abs.is_dir()) or (ch.new_abs and ch.new_abs.is_dir()):
+        if ch.status == "A":
+            return f"(directory added: {ch.path})"
+        if ch.status == "D":
+            return f"(directory removed: {ch.path})"
+        return f"(path type changed: {ch.path})"
+
     old_lines = _safe_read_lines(ch.old_abs)
     new_lines = _safe_read_lines(ch.new_abs)
 
@@ -951,10 +967,27 @@ def copy_changed_file_into_repo(repo: Path, ch: ChangedFile) -> None:
 
     if ch.status == "D":
         if dest.exists():
-            dest.unlink()
+            if dest.is_dir():
+                shutil.rmtree(dest)
+            else:
+                dest.unlink()
         return
 
     assert ch.new_abs is not None
+
+    if dest.exists():
+        dest_is_dir = dest.is_dir()
+        new_is_dir = ch.new_abs.is_dir()
+        if dest_is_dir != new_is_dir:
+            if dest_is_dir:
+                shutil.rmtree(dest)
+            else:
+                dest.unlink()
+
+    if ch.new_abs.is_dir():
+        dest.mkdir(parents=True, exist_ok=True)
+        return
+
     ensure_parent(dest)
     shutil.copy2(ch.new_abs.resolve(), dest)
 
