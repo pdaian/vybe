@@ -156,7 +156,12 @@ DIM = "\033[2m"
 RED = "\033[31m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
+BLUE = "\033[34m"
+MAGENTA = "\033[35m"
 CYAN = "\033[36m"
+WHITE = "\033[37m"
+
+ART_COLORS = [RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, WHITE]
 
 # =============================================================================
 # DATA TYPES
@@ -201,6 +206,10 @@ class CommandError(RuntimeError):
 
 def c(text: str, color: str) -> str:
     return f"{color}{text}{RESET}"
+
+
+def art_color(seed: int, palette: Sequence[str] = ART_COLORS) -> str:
+    return palette[seed % len(palette)]
 
 
 def banner(title: str) -> None:
@@ -464,13 +473,16 @@ class IdleMatrixPanel:
                 row.append(ch)
 
             rendered = []
-            for ch in row:
+            for x, ch in enumerate(row):
                 if ch == "│":
-                    rendered.append(c(ch, CYAN))
+                    rendered.append(c(ch, art_color(scan + x)))
                 elif ch in {"+", "*"}:
-                    rendered.append(c(ch, GREEN))
+                    rendered.append(c(ch, art_color(scan * 3 + x)))
                 elif ch in {".", "·"}:
-                    rendered.append(c(ch, DIM))
+                    if self._rng.random() < 0.35:
+                        rendered.append(c(ch, art_color(scan * 5 + x, ART_COLORS[:-1])))
+                    else:
+                        rendered.append(c(ch, DIM))
                 else:
                     rendered.append(ch)
             body.append("".join(rendered))
@@ -711,17 +723,21 @@ class LiveStatus:
                     chars[yy][xx] = mark
 
         body = []
-        for row in chars:
+        for y, row in enumerate(chars):
             rendered = []
-            for ch in row:
+            for x, ch in enumerate(row):
+                seed = x * 11 + y * 17 + self._tick * 3
                 if ch in {"◉", "✦"}:
-                    rendered.append(c(ch, YELLOW))
+                    rendered.append(c(ch, art_color(seed)))
                 elif ch in {"•", "*", "+"}:
-                    rendered.append(c(ch, GREEN))
+                    rendered.append(c(ch, art_color(seed + 1)))
                 elif ch in {"│", "╎", "─"}:
-                    rendered.append(c(ch, CYAN))
+                    rendered.append(c(ch, art_color(seed + 2)))
                 elif ch in {"·", "."}:
-                    rendered.append(c(ch, DIM))
+                    if (x + y + self._tick) % 4 == 0:
+                        rendered.append(c(ch, art_color(seed + 3, ART_COLORS[:-1])))
+                    else:
+                        rendered.append(c(ch, DIM))
                 else:
                     rendered.append(ch)
             body.append("".join(rendered))
