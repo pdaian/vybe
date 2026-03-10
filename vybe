@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import difflib
 import fnmatch
+import math
 import os
 import random
 import re
@@ -577,6 +578,18 @@ class LiveStatus:
         self._last_lines: List[str] = []
         self._drawn_once = False
         self._spinner_frames = ["|", "/", "-", "\\"]
+        self._radar_phase = [
+            [self._rng.random() * math.tau for _x in range(RADAR_WIDTH)]
+            for _y in range(RADAR_HEIGHT)
+        ]
+        self._radar_bias = [
+            [self._rng.uniform(-0.9, 0.9) for _x in range(RADAR_WIDTH)]
+            for _y in range(RADAR_HEIGHT)
+        ]
+        self._constellations = [
+            (self._rng.randrange(RADAR_WIDTH), self._rng.randrange(RADAR_HEIGHT))
+            for _ in range(5)
+        ]
 
     def start(self) -> None:
         self._start_time = time.time()
@@ -642,28 +655,49 @@ class LiveStatus:
         height = RADAR_HEIGHT
         sweep_x = self._tick % width
         pulse_y = (self._tick // 2) % height
+        t = float(self._tick)
 
         chars: List[List[str]] = []
         for y in range(height):
             row: List[str] = []
             for x in range(width):
+                phase = self._radar_phase[y][x]
+                bias = self._radar_bias[y][x]
+                drift = math.sin(phase + t * 0.20 + x * 0.33)
+                ripple = math.sin((x - y) * 0.48 - t * 0.16 + phase * 0.7)
+                bloom = math.cos((x + y) * 0.35 + t * 0.11 + bias)
+                signal = drift + 0.8 * ripple + 0.6 * bloom + bias * 0.4
+
                 ch = " "
-                if x == sweep_x:
-                    ch = "│"
-                elif x == (sweep_x - 1) % width:
+                if signal > 1.55:
+                    ch = "✦"
+                elif signal > 0.95:
+                    ch = "*"
+                elif signal > 0.40:
+                    ch = "•"
+                elif signal > -0.05:
                     ch = "·"
-                elif x == (sweep_x - 2) % width:
+                elif signal > -0.60:
                     ch = "."
-                if self._rng.random() < 0.018:
-                    ch = self._rng.choice(["·", ".", "*", "+"])
-                if y == pulse_y and self._rng.random() < 0.22:
+
+                if abs(x - sweep_x) == 0:
+                    ch = "│"
+                elif abs(x - sweep_x) == 1:
+                    ch = "╎"
+                elif abs(x - sweep_x) == 2 and ch == " ":
+                    ch = "·"
+
+                arc_y = int((height - 1) * (0.5 + 0.32 * math.sin(t * 0.14 + x * 0.24)))
+                if y == arc_y and (x + self._tick) % 5 == 0:
+                    ch = "─"
+                if y == (pulse_y + (x // 6)) % height and (x + self._tick) % 9 == 0:
                     ch = "•"
                 row.append(ch)
             chars.append(row)
 
-        for i in range(3):
-            cx = (sweep_x + 7 * i + 5) % width
-            cy = (pulse_y + 2 * i + 1) % height
+        for i, (base_x, base_y) in enumerate(self._constellations):
+            cx = (base_x + self._tick * (i + 1)) % width
+            cy = int((base_y + 1.5 * math.sin(t * 0.12 + i * 1.7)) % height)
             for dy, dx, mark in [(0, 0, "◉"), (0, 1, "•"), (1, 0, "•")]:
                 yy = cy + dy
                 xx = cx + dx
@@ -674,9 +708,11 @@ class LiveStatus:
         for row in chars:
             rendered = []
             for ch in row:
-                if ch in {"◉", "•", "*", "+"}:
+                if ch in {"◉", "✦"}:
+                    rendered.append(c(ch, YELLOW))
+                elif ch in {"•", "*", "+"}:
                     rendered.append(c(ch, GREEN))
-                elif ch == "│":
+                elif ch in {"│", "╎", "─"}:
                     rendered.append(c(ch, CYAN))
                 elif ch in {"·", "."}:
                     rendered.append(c(ch, DIM))
@@ -697,7 +733,7 @@ class LiveStatus:
         for line in body:
             rendered.append("│" + line + "│")
         rendered.append(bottom)
-        rendered.append(c(" scanning repo state / diff lattice / patch vectors ", DIM))
+        rendered.append(c(" scanning repo state / signal bloom / patch vectors ", DIM))
         return rendered
 
     def _run(self) -> None:
