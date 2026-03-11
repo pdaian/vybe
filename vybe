@@ -264,6 +264,21 @@ def supports_ansi() -> bool:
     return sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
 
 
+def get_terminal_columns(default: int = 88) -> int:
+    return shutil.get_terminal_size(fallback=(default, 24)).columns
+
+
+def wrap_for_display(text: str, width: int) -> str:
+    wrapper = textwrap.TextWrapper(width=max(1, width), replace_whitespace=False)
+    wrapped_lines: List[str] = []
+    for line in text.splitlines():
+        if not line:
+            wrapped_lines.append("")
+            continue
+        wrapped_lines.extend(wrapper.wrap(line) or [""])
+    return "\n".join(wrapped_lines)
+
+
 def clear_display() -> None:
     if not supports_ansi():
         return
@@ -1137,7 +1152,7 @@ def run_codex(
     print("Command:")
     print(" ".join(shlex.quote(x) for x in cmd[:-1]))
     print("\nPrompt:")
-    print(options.prompt_text)
+    print(wrap_for_display(options.prompt_text, get_terminal_columns() // 2))
     print("\nOutput:")
     print("-" * 88)
 
