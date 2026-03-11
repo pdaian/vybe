@@ -85,4 +85,4 @@ Review the generated diff, inspect any changed files, and apply only when the pa
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](/tmp/codex-run-eseivnbi/working/LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE).

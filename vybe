@@ -1094,6 +1094,19 @@ def extract_summary_from_stream(text: str) -> str:
     return blocks[-1]
 
 
+def normalize_summary_paths(summary: str, working_dir: Path) -> str:
+    base = working_dir.resolve().as_posix().rstrip("/")
+    if not base:
+        return summary
+
+    def replace_abs_path(match: re.Match[str]) -> str:
+        suffix = (match.group(1) or "").lstrip("/")
+        return suffix or "."
+
+    pattern = re.compile(rf"{re.escape(base)}(?:/([^\s)\]>`]+))?")
+    return pattern.sub(replace_abs_path, summary)
+
+
 def run_codex(
     support: CodexSupport,
     working_dir: Path,
@@ -1158,6 +1171,7 @@ def run_codex(
     if not summary:
         summary = "(No summary captured.)"
 
+    summary = normalize_summary_paths(summary, working_dir)
     return summary, combined
 
 
