@@ -1221,8 +1221,11 @@ def stage_all(repo: Path) -> None:
     run_cmd(["git", "add", "-A"], cwd=repo)
 
 
-def commit(repo: Path, message: str) -> None:
-    run_cmd(["git", "commit", "-m", message], cwd=repo)
+def commit(repo: Path, subject: str, body: Optional[str] = None) -> None:
+    cmd = ["git", "commit", "-m", subject]
+    if body:
+        cmd += ["-m", body]
+    run_cmd(cmd, cwd=repo)
 
 
 def branch_has_upstream(repo: Path, branch: str, remote_name: str) -> bool:
@@ -1327,19 +1330,43 @@ def fallback_commit_subject(changed_files: Optional[List[ChangedFile]] = None) -
     return "apply requested changes"
 
 
+def make_commit_body(summary: str, subject: str) -> str:
+    normalized_subject = clean_commit_subject(subject).lower()
+    lines: List[str] = []
+    for raw_line in summary.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+        if clean_commit_subject(line).lower() == normalized_subject:
+            continue
+        lines.append(line)
+
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+
+    body = "\n".join(lines).strip()
+    return body or "Summary: No additional details captured."
+
+
 def make_commit_message(
     prompt_text: str,
     summary: str,
     ch: Optional[ChangedFile] = None,
     changed_files: Optional[List[ChangedFile]] = None,
-) -> str:
+) -> Tuple[str, str]:
     if ch:
-        return f"{COMMIT_PREFIX}: {fallback_commit_subject([ch])}"
+        subject = f"{COMMIT_PREFIX}: {fallback_commit_subject([ch])}"
+        return subject, make_commit_body(summary, subject)
 
     subject = extract_commit_subject(summary, prompt_text)
     if not subject:
         subject = fallback_commit_subject(changed_files)
-    return f"{COMMIT_PREFIX}: {clip_commit_subject(subject)}"
+    subject = f"{COMMIT_PREFIX}: {clip_commit_subject(subject)}"
+    return subject, make_commit_body(summary, subject)
 
 
 def apply_result(repo: Path, result: RunResult) -> None:
@@ -1349,7 +1376,8 @@ def apply_result(repo: Path, result: RunResult) -> None:
         for ch in result.changed_files:
             copy_changed_file_into_repo(repo, ch)
         stage_all(repo)
-        commit(repo, make_commit_message(result.prompt, result.summary, changed_files=result.changed_files))
+        subject, body = make_commit_message(result.prompt, result.summary, changed_files=result.changed_files)
+        commit(repo, subject, body)
         push_branch(repo, branch)
         ok(f"Pushed 1 commit to {GIT_REMOTE_NAME}/{branch}")
         return
@@ -1358,7 +1386,8 @@ def apply_result(repo: Path, result: RunResult) -> None:
         info(f"[{idx}/{len(result.changed_files)}] Applying {ch.path}")
         copy_changed_file_into_repo(repo, ch)
         stage_paths(repo, [ch.path])
-        commit(repo, make_commit_message(result.prompt, result.summary, ch))
+        subject, body = make_commit_message(result.prompt, result.summary, ch)
+        commit(repo, subject, body)
         push_branch(repo, branch)
 
     ok(f"Pushed {len(result.changed_files)} commit(s) to {GIT_REMOTE_NAME}/{branch}")
