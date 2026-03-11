@@ -1152,7 +1152,7 @@ def run_codex(
     print("Command:")
     print(" ".join(shlex.quote(x) for x in cmd[:-1]))
     print("\nPrompt:")
-    print(wrap_for_display(options.prompt_text, get_terminal_columns() // 2))
+    print(wrap_for_display(options.prompt_text, min(80, get_terminal_columns())))
     print("\nOutput:")
     print("-" * 88)
 
