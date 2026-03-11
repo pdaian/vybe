@@ -10,7 +10,7 @@ Low ceremony. High signal. Snapshot the repo, run the agent, inspect the diff, a
 - accepts multiline task input
 - executes `codex exec` against a temp snapshot of the current repo
 - shows summary and changed files
-- supports inspect / apply / reject flow
+- supports inspect / extend / apply / reject flow
 - can commit per file or as one commit
 - defaults to a single commit when applying changes
 - can push after apply
@@ -40,7 +40,7 @@ vybe
 
 Write the task. For multiline input, end with 4 blank lines.
 
-The tool snapshots the repo, sends the task to `codex`, then lets you inspect and decide what lands.
+The tool snapshots the repo, sends the task to `codex`, then lets you inspect, extend with another prompt against the same session, and decide what lands.
 
 To control Codex speed mode, set `VYBE_CODEX_MODE` before launch:
 

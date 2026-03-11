@@ -44,7 +44,7 @@ import tempfile
 import textwrap
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -195,6 +195,8 @@ class RunResult:
     temp_root: Path
     snapshot_dir: Path
     working_dir: Path
+    prompt_history: List[str] = field(default_factory=list)
+    summary_history: List[str] = field(default_factory=list)
 
 
 # =============================================================================
@@ -1001,6 +1003,35 @@ def render_diff(ch: ChangedFile) -> str:
     return "\n".join(colorize_diff_line(line) for line in lines)
 
 
+def summarize_changed_files(changed_files: List[ChangedFile]) -> str:
+    if not changed_files:
+        return "Net diff: no file changes."
+
+    counts = {"A": 0, "M": 0, "D": 0}
+    for ch in changed_files:
+        counts[ch.status] = counts.get(ch.status, 0) + 1
+
+    parts: List[str] = []
+    if counts["A"]:
+        parts.append(f"{counts['A']} added")
+    if counts["M"]:
+        parts.append(f"{counts['M']} modified")
+    if counts["D"]:
+        parts.append(f"{counts['D']} deleted")
+
+    return f"Net diff: {len(changed_files)} file(s) changed ({', '.join(parts)})."
+
+
+def format_session_summary(summary_history: List[str], changed_files: List[ChangedFile]) -> str:
+    latest = (summary_history[-1].strip() if summary_history else "") or "(No summary captured.)"
+    net = summarize_changed_files(changed_files)
+
+    if len(summary_history) <= 1:
+        return f"{latest}\n\n{net}"
+
+    return f"Session prompts: {len(summary_history)}\n\nLatest prompt summary:\n{latest}\n\n{net}"
+
+
 # =============================================================================
 # CODEX EXECUTION
 # =============================================================================
@@ -1025,6 +1056,7 @@ def run_codex(
     prompt_text: str,
 ) -> Tuple[str, str]:
     summary_file = (working_dir.parent / "last_message.txt").resolve()
+    summary_file.unlink(missing_ok=True)
     cmd = build_codex_command(support, prompt_text, summary_file)
 
     banner("RUNNING CODEX")
@@ -1275,7 +1307,7 @@ def apply_result(repo: Path, result: RunResult) -> None:
 # =============================================================================
 
 def print_summary(result: RunResult) -> None:
-    banner("CHANGE SUMMARY")
+    banner("SESSION SUMMARY")
     print(result.summary)
 
     banner("CHANGED FILES")
@@ -1325,13 +1357,34 @@ def inspect_loop(result: RunResult, repo: Path) -> None:
         idle_prompt_line("\nPress Enter to return to inspect menu... ", repo)
 
 
-def decision_loop(repo: Path, result: RunResult) -> None:
+def extend_result(repo: Path, support: CodexSupport, result: RunResult) -> None:
+    extra_prompt = idle_prompt_multiline("\nextend> ", repo).strip()
+    if not extra_prompt:
+        warn("Extend prompt was empty.")
+        return
+
+    summary, _combined = run_codex(support, result.working_dir, extra_prompt)
+    result.prompt_history.append(extra_prompt)
+    result.summary_history.append(summary)
+    result.changed_files = compute_changed_files(repo, result.snapshot_dir, result.working_dir)
+    result.prompt = "\n\n".join(result.prompt_history)
+    result.summary = format_session_summary(result.summary_history, result.changed_files)
+
+    clear_display()
+    print_summary(result)
+
+
+def decision_loop(repo: Path, support: CodexSupport, result: RunResult) -> None:
     while True:
         banner("DECISION")
-        choice = idle_prompt_line("[a]pply / [r]eject / [i]nspect: ", repo).strip().lower()
+        choice = idle_prompt_line("[a]pply / [r]eject / [i]nspect / e[x]tend: ", repo).strip().lower()
 
         if choice in {"i", "inspect"}:
             inspect_loop(result, repo)
+            continue
+
+        if choice in {"x", "extend"}:
+            extend_result(repo, support, result)
             continue
 
         if choice in {"r", "reject"}:
@@ -1345,7 +1398,7 @@ def decision_loop(repo: Path, result: RunResult) -> None:
             apply_result(repo, result)
             return
 
-        warn("Please choose apply, reject, or inspect.")
+        warn("Please choose apply, reject, inspect, or extend.")
 
 
 # =============================================================================
@@ -1392,19 +1445,23 @@ def main() -> int:
             temp_root, snapshot_dir, working_dir = make_temp_snapshot(repo)
             summary, _combined = run_codex(support, working_dir, user_prompt)
             changed_files = compute_changed_files(repo, snapshot_dir, working_dir)
+            prompt_history = [user_prompt]
+            summary_history = [summary]
 
             result = RunResult(
                 prompt=user_prompt,
-                summary=summary,
+                summary=format_session_summary(summary_history, changed_files),
                 changed_files=changed_files,
                 temp_root=temp_root,
                 snapshot_dir=snapshot_dir,
                 working_dir=working_dir,
+                prompt_history=prompt_history,
+                summary_history=summary_history,
             )
 
             clear_display()
             print_summary(result)
-            decision_loop(repo, result)
+            decision_loop(repo, support, result)
 
         except CommandError as e:
             banner("ERROR")
