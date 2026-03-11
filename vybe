@@ -1332,8 +1332,26 @@ def extract_commit_subject(*texts: str) -> str:
     return subjects[0] if subjects else ""
 
 
-def clip_commit_subject(subject: str) -> str:
-    max_len = max(20, 72 - len(COMMIT_PREFIX) - 2)
+def normalize_commit_tag(value: str) -> str:
+    tag = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
+    return tag.strip("-")
+
+
+def derive_commit_tag(branch: str, temp_root: Optional[Path] = None) -> str:
+    if temp_root is not None:
+        tag = temp_root.name
+        if tag.startswith("codex-run-"):
+            tag = tag[len("codex-run-") :]
+        normalized = normalize_commit_tag(tag)
+        if normalized:
+            return normalized
+
+    normalized_branch = normalize_commit_tag(branch.rsplit("/", 1)[-1])
+    return normalized_branch or "workspace"
+
+
+def clip_commit_subject(subject: str, prefix: str) -> str:
+    max_len = max(20, 72 - len(prefix) - 2)
     subject = subject.strip()
     if len(subject) <= max_len:
         return subject
@@ -1378,6 +1396,8 @@ def make_commit_body(summary: str, subject: str) -> str:
 def make_commit_message(
     prompt_text: str,
     summary: str,
+    branch: str,
+    temp_root: Optional[Path] = None,
     summary_history: Optional[List[str]] = None,
     ch: Optional[ChangedFile] = None,
     changed_files: Optional[List[ChangedFile]] = None,
@@ -1403,7 +1423,8 @@ def make_commit_message(
         subject = extract_commit_subject(prompt_text)
     if not subject:
         subject = fallback_commit_subject([ch] if ch else changed_files)
-    subject = f"{COMMIT_PREFIX}: {clip_commit_subject(subject)}"
+    subject_prefix = f"[{derive_commit_tag(branch, temp_root)}] {COMMIT_PREFIX}"
+    subject = f"{subject_prefix}: {clip_commit_subject(subject, subject_prefix)}"
     return subject, make_commit_body(summary, subject)
 
 
@@ -1417,6 +1438,8 @@ def apply_result(repo: Path, result: RunResult) -> None:
         subject, body = make_commit_message(
             result.prompt,
             result.summary,
+            branch=branch,
+            temp_root=result.temp_root,
             summary_history=result.summary_history,
             changed_files=result.changed_files,
         )
@@ -1429,7 +1452,14 @@ def apply_result(repo: Path, result: RunResult) -> None:
         info(f"[{idx}/{len(result.changed_files)}] Applying {ch.path}")
         copy_changed_file_into_repo(repo, ch)
         stage_paths(repo, [ch.path])
-        subject, body = make_commit_message(result.prompt, result.summary, summary_history=result.summary_history, ch=ch)
+        subject, body = make_commit_message(
+            result.prompt,
+            result.summary,
+            branch=branch,
+            temp_root=result.temp_root,
+            summary_history=result.summary_history,
+            ch=ch,
+        )
         commit(repo, subject, body)
         push_branch(repo, branch)
 
