@@ -13,7 +13,7 @@ Low ceremony. High signal. Snapshot the repo, run the agent, inspect the diff, a
 - supports inspect / extend / apply / reject flow
 - can commit per file or as one commit
 - defaults to a single commit when applying changes
-- can push after apply
+- pushes to the configured remote after apply
 - filters generated junk from change detection
 
 ## Install
@@ -52,6 +52,8 @@ VYBE_CODEX_MODE=slow vybe
 
 `fast` and `2x` enable Codex `fast_mode`. `slow` disables it. If unset, `vybe` defaults to `fast`.
 
+Applying changes creates commit(s) and pushes them to the configured git remote for the current branch.
+
 ## Customize vybe with vybe
 
 If `vybe` is in a git repo, you can use `vybe` to modify `vybe` itself.
@@ -83,4 +85,4 @@ Review the generated diff, inspect any changed files, and apply only when the pa
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](/tmp/codex-run-7nbnrh1a/working/LICENSE).
+GPL-3.0-or-later. See [LICENSE](/tmp/codex-run-eseivnbi/working/LICENSE).
