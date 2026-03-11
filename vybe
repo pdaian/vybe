@@ -1353,6 +1353,10 @@ def normalize_commit_tag(value: str) -> str:
 
 
 def derive_commit_tag(branch: str, temp_root: Optional[Path] = None) -> str:
+    normalized_branch = normalize_commit_tag(branch.rsplit("/", 1)[-1])
+    if normalized_branch:
+        return normalized_branch
+
     if temp_root is not None:
         tag = temp_root.name
         if tag.startswith("codex-run-"):
@@ -1361,8 +1365,7 @@ def derive_commit_tag(branch: str, temp_root: Optional[Path] = None) -> str:
         if normalized:
             return normalized
 
-    normalized_branch = normalize_commit_tag(branch.rsplit("/", 1)[-1])
-    return normalized_branch or "workspace"
+    return "workspace"
 
 
 def clip_commit_subject(subject: str, prefix: str) -> str:
