@@ -1066,14 +1066,27 @@ def summarize_changed_files(changed_files: List[ChangedFile]) -> str:
     return f"Net diff: {len(changed_files)} file(s) changed ({', '.join(parts)})."
 
 
+def normalize_summary_text(summary: str) -> str:
+    return summary.strip() or "(No summary captured.)"
+
+
+def format_summary_history(summary_history: List[str]) -> str:
+    entries = [normalize_summary_text(summary) for summary in summary_history]
+    if not entries:
+        return "(No summary captured.)"
+    if len(entries) == 1:
+        return entries[0]
+
+    blocks: List[str] = []
+    for idx, entry in enumerate(entries, start=1):
+        blocks.append(f"Prompt {idx} summary:\n{entry}")
+    return "\n\n".join(blocks)
+
+
 def format_session_summary(summary_history: List[str], changed_files: List[ChangedFile]) -> str:
-    latest = (summary_history[-1].strip() if summary_history else "") or "(No summary captured.)"
+    combined = format_summary_history(summary_history)
     net = summarize_changed_files(changed_files)
-
-    if len(summary_history) <= 1:
-        return f"{latest}\n\n{net}"
-
-    return f"Session prompts: {len(summary_history)}\n\nLatest prompt summary:\n{latest}\n\n{net}"
+    return f"{combined}\n\n{net}"
 
 
 # =============================================================================
@@ -1292,21 +1305,31 @@ def clean_commit_subject(text: str) -> str:
     if not line:
         return ""
     line = re.sub(r"^[\-\*\d\.\)\s]+", "", line)
+    line = re.sub(r"^prompt\s+\d+\s+summary\s*:\s*", "", line, flags=re.I)
     line = re.sub(r"^(summary|result|changes?|updated?|implemented?)\s*:\s*", "", line, flags=re.I)
     line = re.sub(r"\s+", " ", line).strip(" .:-")
     return line
 
 
-def extract_commit_subject(*texts: str) -> str:
+def extract_commit_subjects(*texts: str) -> List[str]:
+    subjects: List[str] = []
+    seen: set[str] = set()
     for text in texts:
         for raw_line in text.splitlines():
             subject = clean_commit_subject(raw_line)
             if not subject:
                 continue
-            if subject.lower() in GENERIC_COMMIT_SUBJECTS:
+            lowered = subject.lower()
+            if lowered in GENERIC_COMMIT_SUBJECTS or lowered.startswith("net diff:") or lowered in seen:
                 continue
-            return subject
-    return ""
+            seen.add(lowered)
+            subjects.append(subject)
+    return subjects
+
+
+def extract_commit_subject(*texts: str) -> str:
+    subjects = extract_commit_subjects(*texts)
+    return subjects[0] if subjects else ""
 
 
 def clip_commit_subject(subject: str) -> str:
@@ -1355,16 +1378,31 @@ def make_commit_body(summary: str, subject: str) -> str:
 def make_commit_message(
     prompt_text: str,
     summary: str,
+    summary_history: Optional[List[str]] = None,
     ch: Optional[ChangedFile] = None,
     changed_files: Optional[List[ChangedFile]] = None,
 ) -> Tuple[str, str]:
-    if ch:
-        subject = f"{COMMIT_PREFIX}: {fallback_commit_subject([ch])}"
-        return subject, make_commit_body(summary, subject)
+    summary_subjects: List[str] = []
+    if summary_history:
+        seen: set[str] = set()
+        for entry in summary_history:
+            subject = extract_commit_subject(entry)
+            if not subject:
+                continue
+            lowered = subject.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            summary_subjects.append(subject)
+    else:
+        summary_subjects = extract_commit_subjects(summary)
 
-    subject = extract_commit_subject(summary, prompt_text)
+    if summary_subjects:
+        subject = "; ".join(summary_subjects)
+    else:
+        subject = extract_commit_subject(prompt_text)
     if not subject:
-        subject = fallback_commit_subject(changed_files)
+        subject = fallback_commit_subject([ch] if ch else changed_files)
     subject = f"{COMMIT_PREFIX}: {clip_commit_subject(subject)}"
     return subject, make_commit_body(summary, subject)
 
@@ -1376,7 +1414,12 @@ def apply_result(repo: Path, result: RunResult) -> None:
         for ch in result.changed_files:
             copy_changed_file_into_repo(repo, ch)
         stage_all(repo)
-        subject, body = make_commit_message(result.prompt, result.summary, changed_files=result.changed_files)
+        subject, body = make_commit_message(
+            result.prompt,
+            result.summary,
+            summary_history=result.summary_history,
+            changed_files=result.changed_files,
+        )
         commit(repo, subject, body)
         push_branch(repo, branch)
         ok(f"Pushed 1 commit to {GIT_REMOTE_NAME}/{branch}")
@@ -1386,7 +1429,7 @@ def apply_result(repo: Path, result: RunResult) -> None:
         info(f"[{idx}/{len(result.changed_files)}] Applying {ch.path}")
         copy_changed_file_into_repo(repo, ch)
         stage_paths(repo, [ch.path])
-        subject, body = make_commit_message(result.prompt, result.summary, ch)
+        subject, body = make_commit_message(result.prompt, result.summary, summary_history=result.summary_history, ch=ch)
         commit(repo, subject, body)
         push_branch(repo, branch)
 
