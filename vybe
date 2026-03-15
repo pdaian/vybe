@@ -36,6 +36,7 @@ import math
 import os
 import random
 import re
+import select
 import shlex
 import shutil
 import subprocess
@@ -199,6 +200,16 @@ class RunResult:
     working_dir: Path
     prompt_history: List[str] = field(default_factory=list)
     summary_history: List[str] = field(default_factory=list)
+
+
+@dataclass
+class PromptQueueState:
+    label: str = "queue> "
+    hint: str = "(finish with 4 blank lines to queue another prompt)"
+    lines: List[str] = field(default_factory=list)
+    blank_streak: int = 0
+    prompts: List[str] = field(default_factory=list)
+    prompt_visible: bool = False
 
 
 @dataclass(frozen=True)
@@ -1135,11 +1146,67 @@ def normalize_summary_paths(summary: str, working_dir: Path) -> str:
     return pattern.sub(replace_abs_path, summary)
 
 
+def maybe_show_queue_prompt(state: PromptQueueState) -> None:
+    if state.prompt_visible or not sys.stdin.isatty():
+        return
+    print(f"\n{state.label}{state.hint}")
+    state.prompt_visible = True
+
+
+def finish_queued_prompt(state: PromptQueueState) -> bool:
+    lines = list(state.lines)
+    while lines and lines[-1] == "":
+        lines.pop()
+    prompt = "\n".join(lines).strip()
+    state.lines.clear()
+    state.blank_streak = 0
+    state.prompt_visible = False
+    if not prompt:
+        return False
+    state.prompts.append(prompt)
+    print("[queued follow-up prompt]")
+    return True
+
+
+def consume_queue_input(state: PromptQueueState) -> None:
+    raw = sys.stdin.readline()
+    if raw == "":
+        return
+
+    line = raw.rstrip("\r\n")
+    state.lines.append(line)
+    if line == "":
+        state.blank_streak += 1
+    else:
+        state.blank_streak = 0
+
+    if state.blank_streak >= 4:
+        state.lines = state.lines[:-4]
+        queued = finish_queued_prompt(state)
+        if queued:
+            maybe_show_queue_prompt(state)
+
+
+def finalize_queued_input(state: PromptQueueState) -> None:
+    if state.lines:
+        finish_queued_prompt(state)
+
+
+def can_queue_input_during_run() -> bool:
+    if not sys.stdin.isatty():
+        return False
+    try:
+        sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        return False
+    return os.name == "posix"
+
+
 def run_codex(
     support: CodexSupport,
     working_dir: Path,
     prompt_text: str,
-) -> Tuple[str, str]:
+) -> Tuple[str, str, List[str]]:
     options = parse_prompt_options(prompt_text)
     if not options.prompt_text:
         raise CommandError("Prompt is empty after removing slash commands.")
@@ -1166,26 +1233,59 @@ def run_codex(
         bufsize=1,
     )
 
-    live = LiveStatus("Codex is thinking", mode="radar")
-    live.start()
+    queue_state = PromptQueueState()
+    queue_enabled = can_queue_input_during_run()
+    show_stream = SHOW_FULL_CODEX_STREAM and not queue_enabled
+
+    live: Optional[LiveStatus] = None
+    if not queue_enabled:
+        live = LiveStatus("Codex is thinking", mode="radar")
+        live.start()
+    else:
+        print("Follow-up prompts entered now will be queued and run automatically.")
+        maybe_show_queue_prompt(queue_state)
 
     out_lines: List[str] = []
     assert proc.stdout is not None
     rc = 0
 
     try:
-        for line in proc.stdout:
-            out_lines.append(line)
-            if SHOW_FULL_CODEX_STREAM:
-                live.pause_for_output()
-                sys.stdout.write(line)
-                sys.stdout.flush()
-                live.resume()
-        rc = proc.wait()
+        stdout_fd = proc.stdout.fileno()
+        stdin_fd = sys.stdin.fileno() if queue_enabled else None
+
+        while True:
+            read_fds = [stdout_fd]
+            if queue_enabled and stdin_fd is not None:
+                read_fds.append(stdin_fd)
+
+            ready, _, _ = select.select(read_fds, [], [], 0.1)
+            if stdin_fd is not None and stdin_fd in ready:
+                consume_queue_input(queue_state)
+
+            if stdout_fd in ready:
+                line = proc.stdout.readline()
+                if line:
+                    out_lines.append(line)
+                    if show_stream:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+
+            if proc.poll() is not None:
+                tail = proc.stdout.read()
+                if tail:
+                    out_lines.append(tail)
+                    if show_stream:
+                        sys.stdout.write(tail)
+                        sys.stdout.flush()
+                rc = proc.returncode
+                break
     finally:
-        live.stop()
+        if live is not None:
+            live.stop()
 
     print("-" * 88)
+    if queue_enabled:
+        finalize_queued_input(queue_state)
 
     combined = "".join(out_lines)
     if rc != 0:
@@ -1200,7 +1300,26 @@ def run_codex(
         summary = "(No summary captured.)"
 
     summary = normalize_summary_paths(summary, working_dir)
-    return summary, combined
+    return summary, combined, queue_state.prompts
+
+
+def run_prompt_chain(
+    support: CodexSupport,
+    working_dir: Path,
+    prompt_text: str,
+) -> Tuple[List[str], List[str]]:
+    pending_prompts = [prompt_text]
+    prompt_history: List[str] = []
+    summary_history: List[str] = []
+
+    while pending_prompts:
+        current_prompt = pending_prompts.pop(0)
+        summary, _combined, queued_prompts = run_codex(support, working_dir, current_prompt)
+        prompt_history.append(current_prompt)
+        summary_history.append(summary)
+        pending_prompts.extend(queued_prompts)
+
+    return prompt_history, summary_history
 
 
 # =============================================================================
@@ -1545,9 +1664,9 @@ def extend_result(repo: Path, support: CodexSupport, result: RunResult) -> None:
         warn("Extend prompt was empty.")
         return
 
-    summary, _combined = run_codex(support, result.working_dir, extra_prompt)
-    result.prompt_history.append(extra_prompt)
-    result.summary_history.append(summary)
+    prompt_history, summary_history = run_prompt_chain(support, result.working_dir, extra_prompt)
+    result.prompt_history.extend(prompt_history)
+    result.summary_history.extend(summary_history)
     result.changed_files = compute_changed_files(repo, result.snapshot_dir, result.working_dir)
     result.prompt = "\n\n".join(result.prompt_history)
     result.summary = format_session_summary(result.summary_history, result.changed_files)
@@ -1625,13 +1744,11 @@ def main() -> int:
         temp_root: Optional[Path] = None
         try:
             temp_root, snapshot_dir, working_dir = make_temp_snapshot(repo)
-            summary, _combined = run_codex(support, working_dir, user_prompt)
+            prompt_history, summary_history = run_prompt_chain(support, working_dir, user_prompt)
             changed_files = compute_changed_files(repo, snapshot_dir, working_dir)
-            prompt_history = [user_prompt]
-            summary_history = [summary]
 
             result = RunResult(
-                prompt=user_prompt,
+                prompt="\n\n".join(prompt_history),
                 summary=format_session_summary(summary_history, changed_files),
                 changed_files=changed_files,
                 temp_root=temp_root,
