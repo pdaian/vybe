@@ -41,7 +41,7 @@ vybe
 
 Write the task. For multiline input, end with 4 blank lines.
 
-The tool snapshots the repo, sends the task to `codex`, lets you queue more prompts while it is still working, then auto-extends against the same session before you inspect and decide what lands.
+The tool snapshots the repo, sends the task to `codex`, keeps the run animation visible, and lets you press `Enter` to open multiline follow-up capture while it is still working. Queued prompts run automatically in order before you inspect and decide what lands.
 
 To control Codex speed mode, set `VYBE_CODEX_MODE` before launch:
 

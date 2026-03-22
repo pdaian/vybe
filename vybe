@@ -45,6 +45,8 @@ import tempfile
 import textwrap
 import threading
 import time
+import tty
+import termios
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -210,6 +212,7 @@ class PromptQueueState:
     blank_streak: int = 0
     prompts: List[str] = field(default_factory=list)
     prompt_visible: bool = False
+    capture_active: bool = False
 
 
 @dataclass(frozen=True)
@@ -674,6 +677,8 @@ class LiveStatus:
     def __init__(self, label: str = "Codex is thinking", mode: str = "radar") -> None:
         self.label = label
         self.mode = mode
+        self.queue_count = 0
+        self.queue_hint = "press Enter to queue follow-up"
         self._stop = threading.Event()
         self._pause = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -754,7 +759,9 @@ class LiveStatus:
 
     def _render_spinner(self, elapsed: float) -> List[str]:
         frame = self._spinner_frames[self._tick % len(self._spinner_frames)]
-        return [f"{DIM}{frame} {self.label}... {elapsed:5.1f}s{RESET}"]
+        return [
+            f"{DIM}{frame} {self.label}... {elapsed:5.1f}s  queued={self.queue_count}  {self.queue_hint}{RESET}"
+        ]
 
     def _render_radar(self, elapsed: float) -> List[str]:
         width = RADAR_WIDTH
@@ -845,7 +852,7 @@ class LiveStatus:
         for line in body:
             rendered.append("│" + line + "│")
         rendered.append(bottom)
-        rendered.append(c(" scanning repo state / signal bloom / patch vectors ", DIM))
+        rendered.append(c(f" queued={self.queue_count} :: {self.queue_hint} ", DIM))
         return rendered
 
     def _run(self) -> None:
@@ -876,6 +883,11 @@ class LiveStatus:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=1.0)
+
+    def set_queue_status(self, queue_count: int, hint: Optional[str] = None) -> None:
+        self.queue_count = queue_count
+        if hint is not None:
+            self.queue_hint = hint
 
 
 # =============================================================================
@@ -1149,8 +1161,12 @@ def normalize_summary_paths(summary: str, working_dir: Path) -> str:
 def maybe_show_queue_prompt(state: PromptQueueState) -> None:
     if state.prompt_visible or not sys.stdin.isatty():
         return
-    print(f"\n{state.label}{state.hint}")
+    queued_count = len(state.prompts)
+    status = f"queued={queued_count}" if queued_count else "queued=0"
+    print(f"\n[{status}] press Enter again when done to resume animation")
+    print(f"{state.label}{state.hint}")
     state.prompt_visible = True
+    state.capture_active = True
 
 
 def finish_queued_prompt(state: PromptQueueState) -> bool:
@@ -1161,17 +1177,24 @@ def finish_queued_prompt(state: PromptQueueState) -> bool:
     state.lines.clear()
     state.blank_streak = 0
     state.prompt_visible = False
+    state.capture_active = False
     if not prompt:
         return False
     state.prompts.append(prompt)
-    print("[queued follow-up prompt]")
+    print(f"[queued follow-up prompt #{len(state.prompts)}]")
     return True
 
 
-def consume_queue_input(state: PromptQueueState) -> None:
+def begin_queue_capture(state: PromptQueueState) -> None:
+    if state.capture_active:
+        return
+    maybe_show_queue_prompt(state)
+
+
+def consume_queue_input(state: PromptQueueState) -> bool:
     raw = sys.stdin.readline()
     if raw == "":
-        return
+        return False
 
     line = raw.rstrip("\r\n")
     state.lines.append(line)
@@ -1182,14 +1205,41 @@ def consume_queue_input(state: PromptQueueState) -> None:
 
     if state.blank_streak >= 4:
         state.lines = state.lines[:-4]
-        queued = finish_queued_prompt(state)
-        if queued:
-            maybe_show_queue_prompt(state)
+        return finish_queued_prompt(state)
+    return False
 
 
 def finalize_queued_input(state: PromptQueueState) -> None:
     if state.lines:
         finish_queued_prompt(state)
+
+
+class QueueInputController:
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+        self._attrs: Optional[List[object]] = None
+        self._cbreak_enabled = False
+
+    def enable_cbreak(self) -> None:
+        if self._cbreak_enabled:
+            return
+        if self._attrs is None:
+            self._attrs = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        self._cbreak_enabled = True
+
+    def disable_cbreak(self) -> None:
+        if not self._cbreak_enabled or self._attrs is None:
+            return
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self._attrs)
+        self._cbreak_enabled = False
+
+    def read_key(self) -> str:
+        try:
+            data = os.read(self.fd, 1)
+        except OSError:
+            return ""
+        return data.decode(errors="ignore")
 
 
 def can_queue_input_during_run() -> bool:
@@ -1238,12 +1288,12 @@ def run_codex(
     show_stream = SHOW_FULL_CODEX_STREAM and not queue_enabled
 
     live: Optional[LiveStatus] = None
-    if not queue_enabled:
-        live = LiveStatus("Codex is thinking", mode="radar")
-        live.start()
-    else:
+    queue_input: Optional[QueueInputController] = None
+    live = LiveStatus("Codex is thinking", mode="radar")
+    live.start()
+    if queue_enabled:
         print("Follow-up prompts entered now will be queued and run automatically.")
-        maybe_show_queue_prompt(queue_state)
+        live.set_queue_status(0, "press Enter to queue follow-up")
 
     out_lines: List[str] = []
     assert proc.stdout is not None
@@ -1252,6 +1302,9 @@ def run_codex(
     try:
         stdout_fd = proc.stdout.fileno()
         stdin_fd = sys.stdin.fileno() if queue_enabled else None
+        if stdin_fd is not None:
+            queue_input = QueueInputController(stdin_fd)
+            queue_input.enable_cbreak()
 
         while True:
             read_fds = [stdout_fd]
@@ -1260,7 +1313,29 @@ def run_codex(
 
             ready, _, _ = select.select(read_fds, [], [], 0.1)
             if stdin_fd is not None and stdin_fd in ready:
-                consume_queue_input(queue_state)
+                if queue_state.capture_active:
+                    was_capturing = queue_state.capture_active
+                    consume_queue_input(queue_state)
+                    if was_capturing and not queue_state.capture_active:
+                        if live is not None:
+                            live.set_queue_status(
+                                len(queue_state.prompts),
+                                "press Enter to queue another follow-up",
+                            )
+                            live.resume()
+                        if queue_input is not None:
+                            queue_input.enable_cbreak()
+                else:
+                    assert queue_input is not None
+                    key = queue_input.read_key()
+                    if key in {"\n", "\r"}:
+                        queue_input.disable_cbreak()
+                        if live is not None:
+                            live.pause_for_output()
+                        begin_queue_capture(queue_state)
+                    elif key:
+                        sys.stdout.write("\a")
+                        sys.stdout.flush()
 
             if stdout_fd in ready:
                 line = proc.stdout.readline()
@@ -1280,6 +1355,8 @@ def run_codex(
                 rc = proc.returncode
                 break
     finally:
+        if queue_input is not None:
+            queue_input.disable_cbreak()
         if live is not None:
             live.stop()
 
