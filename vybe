@@ -94,6 +94,7 @@ SPINNER_INTERVAL = 0.10
 RADAR_INTERVAL = 0.14
 RADAR_WIDTH = 38
 RADAR_HEIGHT = 6
+RADAR_SCALE = 4
 
 IGNORE_GLOBS = [
     "__pycache__",
@@ -280,6 +281,10 @@ def supports_ansi() -> bool:
 
 def get_terminal_columns(default: int = 88) -> int:
     return shutil.get_terminal_size(fallback=(default, 24)).columns
+
+
+def get_terminal_rows(default: int = 24) -> int:
+    return shutil.get_terminal_size(fallback=(88, default)).lines
 
 
 def wrap_for_display(text: str, width: int) -> str:
@@ -723,16 +728,18 @@ class LiveStatus:
         self._last_lines: List[str] = []
         self._drawn_once = False
         self._spinner_frames = ["|", "/", "-", "\\"]
+        self._radar_width = max(12, min(RADAR_WIDTH * RADAR_SCALE, get_terminal_columns() - 2))
+        self._radar_height = max(4, min(RADAR_HEIGHT * RADAR_SCALE, get_terminal_rows() - 8))
         self._radar_phase = [
-            [self._rng.random() * math.tau for _x in range(RADAR_WIDTH)]
-            for _y in range(RADAR_HEIGHT)
+            [self._rng.random() * math.tau for _x in range(self._radar_width)]
+            for _y in range(self._radar_height)
         ]
         self._radar_bias = [
-            [self._rng.uniform(-0.9, 0.9) for _x in range(RADAR_WIDTH)]
-            for _y in range(RADAR_HEIGHT)
+            [self._rng.uniform(-0.9, 0.9) for _x in range(self._radar_width)]
+            for _y in range(self._radar_height)
         ]
         self._constellations = [
-            (self._rng.randrange(RADAR_WIDTH), self._rng.randrange(RADAR_HEIGHT))
+            (self._rng.randrange(self._radar_width), self._rng.randrange(self._radar_height))
             for _ in range(5)
         ]
 
@@ -798,8 +805,8 @@ class LiveStatus:
         ]
 
     def _render_radar(self, elapsed: float) -> List[str]:
-        width = RADAR_WIDTH
-        height = RADAR_HEIGHT
+        width = self._radar_width
+        height = self._radar_height
         sweep_x = self._tick % width
         pulse_y = (self._tick // 2) % height
         t = float(self._tick)
