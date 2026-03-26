@@ -327,6 +327,10 @@ def run_cmd(
     return proc
 
 
+def relpath_posix(path: Path, start: Path) -> str:
+    return str(path.relative_to(start)).replace("\\", "/")
+
+
 def ensure_binary(name: str) -> None:
     if shutil.which(name) is None:
         raise SystemExit(f"Missing required binary in PATH: {name}")
@@ -348,6 +352,36 @@ def get_current_branch(repo: Path) -> str:
     if branch == "HEAD":
         raise SystemExit("Detached HEAD is not supported.")
     return branch
+
+
+def get_submodule_paths(repo: Path) -> List[str]:
+    gitmodules = repo / ".gitmodules"
+    if not gitmodules.is_file():
+        return []
+
+    proc = run_cmd(["git", "submodule", "status", "--recursive"], cwd=repo, check=False)
+    if proc.returncode not in (0,):
+        raise CommandError(f"git submodule status failed:\n{proc.stderr}")
+
+    paths: List[str] = []
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        state = line[0]
+        body = line[1:].strip()
+        parts = body.split()
+        if len(parts) < 2:
+            continue
+        submodule_path = parts[1].replace("\\", "/")
+        if state == "-":
+            raise CommandError(
+                f"Submodule {submodule_path!r} is not initialized. "
+                "Initialize submodules before running vybe."
+            )
+        paths.append(submodule_path)
+
+    return sorted(set(paths), key=lambda value: (value.count("/"), value))
 
 
 def ensure_clean_repo(repo: Path) -> None:
@@ -952,18 +986,10 @@ def make_temp_snapshot(repo: Path) -> Tuple[Path, Path, Path]:
     working = (temp_root / "working").resolve()
     snapshot.mkdir(parents=True, exist_ok=True)
 
-    archive_path = (temp_root / "repo.tar").resolve()
-    with archive_path.open("wb") as f:
-        proc = subprocess.run(
-            ["git", "archive", "--format=tar", "HEAD"],
-            cwd=str(repo),
-            stdout=f,
-            stderr=subprocess.PIPE,
-        )
-        if proc.returncode != 0:
-            raise CommandError(f"git archive failed:\n{proc.stderr.decode()}")
+    archive_git_repo(repo, snapshot)
+    for submodule_path in get_submodule_paths(repo):
+        archive_git_repo(repo / submodule_path, snapshot / submodule_path)
 
-    run_cmd(["tar", "-xf", str(archive_path), "-C", str(snapshot)])
     shutil.copytree(snapshot, working, dirs_exist_ok=False)
     init_temp_git_repo(working)
     return temp_root, snapshot, working
@@ -971,6 +997,27 @@ def make_temp_snapshot(repo: Path) -> Tuple[Path, Path, Path]:
 
 def cleanup_temp_dir(temp_root: Path) -> None:
     shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def archive_git_repo(repo: Path, dest: Path) -> None:
+    repo = repo.resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix="vybe-archive-", suffix=".tar", delete=False) as tmp:
+        archive_path = Path(tmp.name).resolve()
+
+    try:
+        with archive_path.open("wb") as f:
+            proc = subprocess.run(
+                ["git", "archive", "--format=tar", "HEAD"],
+                cwd=str(repo),
+                stdout=f,
+                stderr=subprocess.PIPE,
+            )
+        if proc.returncode != 0:
+            raise CommandError(f"git archive failed in {repo}:\n{proc.stderr.decode()}")
+        run_cmd(["tar", "-xf", str(archive_path), "-C", str(dest)])
+    finally:
+        archive_path.unlink(missing_ok=True)
 
 
 def init_temp_git_repo(working_dir: Path) -> None:
@@ -1407,8 +1454,20 @@ def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def copy_changed_file_into_repo(repo: Path, ch: ChangedFile) -> None:
-    dest = (repo.resolve() / ch.path).resolve()
+def split_repo_relpath(relpath: str, submodule_paths: Sequence[str]) -> Tuple[str, str]:
+    relpath = relpath.replace("\\", "/")
+    for submodule_path in sorted(submodule_paths, key=len, reverse=True):
+        prefix = f"{submodule_path}/"
+        if relpath == submodule_path:
+            return submodule_path, "."
+        if relpath.startswith(prefix):
+            return submodule_path, relpath[len(prefix):]
+    return "", relpath
+
+
+def copy_changed_file_into_repo(repo: Path, ch: ChangedFile, repo_relpath: Optional[str] = None) -> None:
+    target_relpath = repo_relpath or ch.path
+    dest = (repo.resolve() / target_relpath).resolve()
 
     if ch.status == "D":
         if dest.exists():
@@ -1643,28 +1702,60 @@ def make_commit_message(
 
 
 def apply_result(repo: Path, result: RunResult) -> None:
-    branch = get_current_branch(repo)
+    submodule_paths = get_submodule_paths(repo)
+    changed_repo_paths: set[Path] = set()
+    root_changed = False
+
+    for ch in result.changed_files:
+        repo_prefix, repo_relpath = split_repo_relpath(ch.path, submodule_paths)
+        target_repo = repo / repo_prefix if repo_prefix else repo
+        copy_changed_file_into_repo(target_repo, ch, repo_relpath)
+        changed_repo_paths.add(target_repo.resolve())
+        if not repo_prefix:
+            root_changed = True
+
+    submodule_repos = sorted(
+        (path for path in changed_repo_paths if path != repo.resolve()),
+        key=lambda path: relpath_posix(path, repo),
+    )
 
     if COMMIT_MODE == "single":
-        for ch in result.changed_files:
-            copy_changed_file_into_repo(repo, ch)
-        stage_all(repo)
-        subject, body = make_commit_message(
-            result.prompt,
-            result.summary,
-            branch=branch,
-            temp_root=result.temp_root,
-            summary_history=result.summary_history,
-            changed_files=result.changed_files,
-        )
-        commit(repo, subject, body)
-        push_branch(repo, branch)
-        ok(f"Pushed 1 commit to {GIT_REMOTE_NAME}/{branch}")
+        for submodule_repo in submodule_repos:
+            submodule_branch = get_current_branch(submodule_repo)
+            stage_all(submodule_repo)
+            subject, body = make_commit_message(
+                result.prompt,
+                result.summary,
+                branch=submodule_branch,
+                temp_root=result.temp_root,
+                summary_history=result.summary_history,
+                changed_files=result.changed_files,
+            )
+            commit(submodule_repo, subject, body)
+            push_branch(submodule_repo, submodule_branch)
+
+        if root_changed or submodule_repos:
+            branch = get_current_branch(repo)
+            stage_all(repo)
+            subject, body = make_commit_message(
+                result.prompt,
+                result.summary,
+                branch=branch,
+                temp_root=result.temp_root,
+                summary_history=result.summary_history,
+                changed_files=result.changed_files,
+            )
+            commit(repo, subject, body)
+            push_branch(repo, branch)
+            ok(f"Pushed {1 + len(submodule_repos)} commit(s) across root/submodule repos")
         return
 
+    if submodule_repos:
+        raise SystemExit("Submodule changes are only supported when COMMIT_MODE is 'single'.")
+
+    branch = get_current_branch(repo)
     for idx, ch in enumerate(result.changed_files, start=1):
         info(f"[{idx}/{len(result.changed_files)}] Applying {ch.path}")
-        copy_changed_file_into_repo(repo, ch)
         stage_paths(repo, [ch.path])
         subject, body = make_commit_message(
             result.prompt,

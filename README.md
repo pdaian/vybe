@@ -9,11 +9,13 @@ Low ceremony. High signal. Snapshot the repo, run the agent, inspect the diff, a
 - runs a long-lived prompt loop
 - accepts multiline task input
 - executes `codex exec` against a temp snapshot of the current repo
+- includes initialized git submodule contents in that snapshot
 - shows summary and changed files
 - supports inspect / extend / apply / reject flow
 - queues follow-up prompts while Codex is still running, then auto-extends in order
 - can commit per file or as one commit
 - defaults to a single commit when applying changes
+- applies submodule edits in `single` commit mode by committing submodules first, then the superproject
 - pushes to the configured remote after apply
 - filters generated junk from change detection
 
@@ -42,6 +44,8 @@ vybe
 Write the task. For multiline input, end with 4 blank lines.
 
 The tool snapshots the repo, sends the task to `codex`, keeps the run animation visible, and lets you press `Enter` to open multiline follow-up capture while it is still working. Queued prompts run automatically in order before you inspect and decide what lands.
+
+If the repo uses initialized submodules, their tracked contents are included in the temp workspace so Codex can inspect and edit them too.
 
 To control Codex speed mode, set `VYBE_CODEX_MODE` before launch:
 
