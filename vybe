@@ -60,7 +60,7 @@ SCRIPT_PATH = Path(__file__).resolve()
 CODEX_BINARY = "codex"
 CODEX_MODEL = "gpt-5.5"
 CODEX_SANDBOX = "workspace-write"
-CODEX_REASONING_EFFORT = "xhigh"
+CODEX_REASONING_EFFORT = "max"
 CODEX_ENABLE_WEB_SEARCH = False
 CODEX_USE_JSON_IF_AVAILABLE = True
 CODEX_MODE_ENV_VAR = "VYBE_CODEX_MODE"
@@ -222,6 +222,12 @@ class PromptOptions:
     prompt_text: str
     enable_search: bool = False
     plan_mode: bool = False
+
+
+@dataclass(frozen=True)
+class ReasoningEffort:
+    label: str
+    codex_value: str
 
 
 # =============================================================================
@@ -463,17 +469,17 @@ def get_codex_mode() -> str:
     return mode
 
 
-def get_codex_reasoning_effort() -> str:
+def get_codex_reasoning_effort() -> ReasoningEffort:
     raw = os.environ.get(CODEX_REASONING_ENV_VAR, CODEX_REASONING_EFFORT).strip().lower()
     aliases = {
-        "max": "xhigh",
-        "extra": "xhigh",
-        "xhigh": "xhigh",
-        "high": "high",
-        "medium": "medium",
-        "normal": "medium",
-        "low": "low",
-        "fast": "low",
+        "max": ReasoningEffort("max", "xhigh"),
+        "extra": ReasoningEffort("max", "xhigh"),
+        "xhigh": ReasoningEffort("xhigh", "xhigh"),
+        "high": ReasoningEffort("high", "high"),
+        "medium": ReasoningEffort("medium", "medium"),
+        "normal": ReasoningEffort("medium", "medium"),
+        "low": ReasoningEffort("low", "low"),
+        "fast": ReasoningEffort("low", "low"),
     }
     effort = aliases.get(raw)
     if effort is None:
@@ -898,7 +904,7 @@ class LiveStatus:
 
         status_a = f"model={CODEX_MODEL}"
         status_b = f"t={elapsed:5.1f}s"
-        status_c = f"mode={CODEX_SANDBOX} reasoning={get_codex_reasoning_effort()}"
+        status_c = f"mode={CODEX_SANDBOX} reasoning={get_codex_reasoning_effort().label}"
 
         top = f"┌{'─' * width}┐"
         bottom = f"└{'─' * width}┘"
@@ -973,7 +979,7 @@ def build_codex_command(
         "exec", "--skip-git-repo-check",
         "--model", CODEX_MODEL,
         "--sandbox", CODEX_SANDBOX,
-        "--config", f"model_reasoning_effort={reasoning_effort!r}",
+        "--config", f"model_reasoning_effort={reasoning_effort.codex_value!r}",
     ]
 
     if codex_mode == "fast":
@@ -1916,7 +1922,7 @@ def main() -> int:
     print(f"Repo:   {repo}")
     print(f"Model:  {CODEX_MODEL}")
     print(f"Mode:   {codex_mode}")
-    print(f"Reason: {reasoning_effort}")
+    print(f"Reason: {reasoning_effort.label}")
     print(f"Remote: {GIT_REMOTE_NAME}")
     print(f"Commit: {COMMIT_MODE}")
     print(

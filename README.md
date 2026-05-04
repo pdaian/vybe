@@ -47,7 +47,7 @@ The tool snapshots the repo, sends the task to `codex`, keeps the run animation 
 
 If the repo uses initialized submodules, their tracked contents are included in the temp workspace so Codex can inspect and edit them too.
 
-`vybe` defaults to GPT-5.5 with `xhigh` reasoning and Codex `fast_mode` disabled for higher-quality coding runs.
+`vybe` defaults to GPT-5.5 with `max` reasoning and Codex `fast_mode` disabled for higher-quality coding runs. `max` maps to Codex `xhigh`, the highest reasoning effort currently supported by GPT-5.5 in the Codex CLI.
 
 To trade quality for speed, set `VYBE_CODEX_MODE` before launch:
 
@@ -64,9 +64,10 @@ To tune reasoning depth, set `VYBE_CODEX_REASONING_EFFORT`:
 ```bash
 VYBE_CODEX_REASONING_EFFORT=high vybe
 VYBE_CODEX_REASONING_EFFORT=xhigh vybe
+VYBE_CODEX_REASONING_EFFORT=max vybe
 ```
 
-Accepted reasoning values are `low`, `medium`, `high`, `xhigh`, `extra`, and `max`. If unset, `vybe` defaults to `xhigh`.
+Accepted reasoning values are `low`, `medium`, `high`, `xhigh`, `extra`, and `max`. If unset, `vybe` defaults to `max`.
 
 Applying changes creates commit(s) and pushes them to the configured git remote for the current branch.
 
