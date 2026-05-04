@@ -47,7 +47,9 @@ The tool snapshots the repo, sends the task to `codex`, keeps the run animation 
 
 If the repo uses initialized submodules, their tracked contents are included in the temp workspace so Codex can inspect and edit them too.
 
-To control Codex speed mode, set `VYBE_CODEX_MODE` before launch:
+`vybe` defaults to GPT-5.5 with `xhigh` reasoning and Codex `fast_mode` disabled for higher-quality coding runs.
+
+To trade quality for speed, set `VYBE_CODEX_MODE` before launch:
 
 ```bash
 VYBE_CODEX_MODE=fast vybe
@@ -55,7 +57,16 @@ VYBE_CODEX_MODE=2x vybe
 VYBE_CODEX_MODE=slow vybe
 ```
 
-`fast` and `2x` enable Codex `fast_mode`. `slow` disables it. If unset, `vybe` defaults to `fast`.
+`fast` and `2x` enable Codex `fast_mode`. `slow` disables it. If unset, `vybe` defaults to `slow`.
+
+To tune reasoning depth, set `VYBE_CODEX_REASONING_EFFORT`:
+
+```bash
+VYBE_CODEX_REASONING_EFFORT=high vybe
+VYBE_CODEX_REASONING_EFFORT=xhigh vybe
+```
+
+Accepted reasoning values are `low`, `medium`, `high`, `xhigh`, `extra`, and `max`. If unset, `vybe` defaults to `xhigh`.
 
 Applying changes creates commit(s) and pushes them to the configured git remote for the current branch.
 
@@ -86,6 +97,7 @@ Review the generated diff, inspect any changed files, and apply only when the pa
 - git push auth can come from `GIT_REMOTE_USERNAME` / `GIT_REMOTE_TOKEN` in the script, or from `~/github.pat`
 - `~/github.pat` format: first line GitHub username, second line PAT/token
 - `VYBE_CODEX_MODE` accepts `fast`, `2x`, `slow`, or `normal`
+- `VYBE_CODEX_REASONING_EFFORT` accepts `low`, `medium`, `high`, `xhigh`, `extra`, or `max`
 - do not hardcode secrets into the script
 
 ## License
