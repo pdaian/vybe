@@ -58,7 +58,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 SCRIPT_PATH = Path(__file__).resolve()
 
 CODEX_BINARY = "codex"
-CODEX_MODEL = "gpt-5.5"
+CODEX_MODEL = "gpt-5.5-pro"
 CODEX_SANDBOX = "workspace-write"
 CODEX_ENABLE_WEB_SEARCH = False
 CODEX_USE_JSON_IF_AVAILABLE = True
