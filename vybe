@@ -238,6 +238,10 @@ class CommandError(RuntimeError):
     pass
 
 
+class RetryablePromptError(CommandError):
+    pass
+
+
 # =============================================================================
 # BASIC HELPERS
 # =============================================================================
@@ -395,7 +399,7 @@ def get_submodule_paths(repo: Path) -> List[str]:
 def ensure_clean_repo(repo: Path) -> None:
     proc = run_cmd(["git", "status", "--porcelain"], cwd=repo)
     if proc.stdout.strip():
-        raise SystemExit(
+        raise RetryablePromptError(
             "Working tree is not clean. Commit, stash, or discard local changes first."
         )
 
@@ -726,6 +730,21 @@ def idle_prompt_multiline(label: str, repo: Path) -> str:
     finally:
         if panel is not None:
             panel.clear()
+
+
+def prompt_retry_saved_prompt(repo: Path) -> str:
+    while True:
+        choice = idle_prompt_line(
+            "\nSaved prompt. Press Enter to retry, or type discard/quit: ",
+            repo,
+        ).strip().lower()
+        if choice in {"", "r", "retry"}:
+            return "retry"
+        if choice in {"d", "discard"}:
+            return "discard"
+        if choice in {"q", "quit", "exit"}:
+            return "quit"
+        warn("Please press Enter to retry, type discard, or type quit.")
 
 
 # =============================================================================
@@ -1940,38 +1959,48 @@ def main() -> int:
         if not user_prompt:
             continue
 
-        ensure_clean_repo(repo)
+        while True:
+            temp_root: Optional[Path] = None
+            try:
+                ensure_clean_repo(repo)
+                temp_root, snapshot_dir, working_dir = make_temp_snapshot(repo)
+                prompt_history, summary_history = run_prompt_chain(support, working_dir, user_prompt)
+                changed_files = compute_changed_files(repo, snapshot_dir, working_dir)
 
-        temp_root: Optional[Path] = None
-        try:
-            temp_root, snapshot_dir, working_dir = make_temp_snapshot(repo)
-            prompt_history, summary_history = run_prompt_chain(support, working_dir, user_prompt)
-            changed_files = compute_changed_files(repo, snapshot_dir, working_dir)
+                result = RunResult(
+                    prompt="\n\n".join(prompt_history),
+                    summary=format_session_summary(summary_history, changed_files),
+                    changed_files=changed_files,
+                    temp_root=temp_root,
+                    snapshot_dir=snapshot_dir,
+                    working_dir=working_dir,
+                    prompt_history=prompt_history,
+                    summary_history=summary_history,
+                )
 
-            result = RunResult(
-                prompt="\n\n".join(prompt_history),
-                summary=format_session_summary(summary_history, changed_files),
-                changed_files=changed_files,
-                temp_root=temp_root,
-                snapshot_dir=snapshot_dir,
-                working_dir=working_dir,
-                prompt_history=prompt_history,
-                summary_history=summary_history,
-            )
+                clear_display()
+                print_summary(result)
+                decision_loop(repo, support, result)
 
-            clear_display()
-            print_summary(result)
-            decision_loop(repo, support, result)
-
-        except CommandError as e:
-            banner("ERROR")
-            err(str(e))
-        except Exception as e:
-            banner("UNEXPECTED ERROR")
-            err(repr(e))
-        finally:
-            if temp_root is not None:
-                cleanup_temp_dir(temp_root)
+            except RetryablePromptError as e:
+                banner("GIT BLOCKED")
+                err(str(e))
+                action = prompt_retry_saved_prompt(repo)
+                if action == "retry":
+                    continue
+                if action == "quit":
+                    print("Bye.")
+                    return 0
+            except CommandError as e:
+                banner("ERROR")
+                err(str(e))
+            except Exception as e:
+                banner("UNEXPECTED ERROR")
+                err(repr(e))
+            finally:
+                if temp_root is not None:
+                    cleanup_temp_dir(temp_root)
+            break
 
 
 if __name__ == "__main__":
