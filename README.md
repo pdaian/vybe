@@ -47,7 +47,13 @@ The tool snapshots the repo, sends the task to `codex`, keeps the run animation 
 
 If the repo uses initialized submodules, their tracked contents are included in the temp workspace so Codex can inspect and edit them too.
 
-`vybe` defaults to GPT-5.5 with `max` reasoning and Codex `fast_mode` disabled for higher-quality coding runs. `max` maps to Codex `xhigh`, the highest reasoning effort currently supported by GPT-5.5 in the Codex CLI.
+`vybe` defaults to GPT-5.6 Sol with `max` reasoning, high verbosity, web search enabled when supported by the Codex CLI, and Codex `fast_mode` disabled for higher-quality coding runs. For ChatGPT Pro subscription usage, sign in to Codex with ChatGPT rather than relying on an API key.
+
+If your installed Codex CLI does not yet support GPT-5.6, update Codex or override the model:
+
+```bash
+VYBE_CODEX_MODEL=gpt-5.5 vybe
+```
 
 To trade quality for speed, set `VYBE_CODEX_MODE` before launch:
 
@@ -68,6 +74,16 @@ VYBE_CODEX_REASONING_EFFORT=max vybe
 ```
 
 Accepted reasoning values are `low`, `medium`, `high`, `xhigh`, `extra`, and `max`. If unset, `vybe` defaults to `max`.
+
+For GPT-5.6 models, `max` is passed through as Codex `max`. For older models, `max` maps to Codex `xhigh`, the strongest broadly supported non-GPT-5.6 reasoning effort.
+
+To tune default response detail, set `VYBE_CODEX_VERBOSITY`:
+
+```bash
+VYBE_CODEX_VERBOSITY=high vybe
+VYBE_CODEX_VERBOSITY=medium vybe
+VYBE_CODEX_VERBOSITY=low vybe
+```
 
 Applying changes creates commit(s) and pushes them to the configured git remote for the current branch.
 
@@ -99,6 +115,8 @@ Review the generated diff, inspect any changed files, and apply only when the pa
 - `~/github.pat` format: first line GitHub username, second line PAT/token
 - `VYBE_CODEX_MODE` accepts `fast`, `2x`, `slow`, or `normal`
 - `VYBE_CODEX_REASONING_EFFORT` accepts `low`, `medium`, `high`, `xhigh`, `extra`, or `max`
+- `VYBE_CODEX_MODEL` overrides the default `gpt-5.6-sol` model
+- `VYBE_CODEX_VERBOSITY` accepts `low`, `medium`, or `high`
 - do not hardcode secrets into the script
 
 ## License

@@ -58,21 +58,27 @@ from typing import Dict, List, Optional, Sequence, Tuple
 SCRIPT_PATH = Path(__file__).resolve()
 
 CODEX_BINARY = "codex"
-CODEX_MODEL = "gpt-5.5"
+CODEX_MODEL = "gpt-5.6-sol"
 CODEX_SANDBOX = "workspace-write"
 CODEX_REASONING_EFFORT = "max"
-CODEX_ENABLE_WEB_SEARCH = False
+CODEX_VERBOSITY = "high"
+CODEX_ENABLE_WEB_SEARCH = True
 CODEX_USE_JSON_IF_AVAILABLE = True
+CODEX_MODEL_ENV_VAR = "VYBE_CODEX_MODEL"
 CODEX_MODE_ENV_VAR = "VYBE_CODEX_MODE"
 CODEX_REASONING_ENV_VAR = "VYBE_CODEX_REASONING_EFFORT"
+CODEX_VERBOSITY_ENV_VAR = "VYBE_CODEX_VERBOSITY"
+CODEX_BACKGROUND_TERMINAL_MAX_TIMEOUT_MS = 3_600_000
 OPENAI_API_KEY = ""
 
 CODEX_EXTRA_SUFFIX = """
+Run in quality-first mode for ChatGPT Pro / highest-capability usage. Prioritize correctness, completeness, and careful verification over latency, token use, or credit savings.
 Please make the requested changes directly in the repository files.
-Keep the solution minimal, correct, and production-ready.
+Keep the solution minimal, correct, production-ready, and consistent with the existing project.
 Do not create caches, build artifacts, test output files, coverage files, or temporary files.
 Avoid __pycache__, .pytest_cache, .mypy_cache, dist, build, coverage outputs, and similar generated files.
-At the end, provide a concise summary of what changed.
+Run relevant non-destructive validation when feasible.
+At the end, provide a concise summary of what changed and any validation performed.
 """
 
 PLAN_MODE_CODE_PROMPT = "Please make the requested changes directly in the repository files."
@@ -473,11 +479,18 @@ def get_codex_mode() -> str:
     return mode
 
 
+def get_codex_model() -> str:
+    model = os.environ.get(CODEX_MODEL_ENV_VAR, CODEX_MODEL).strip()
+    return model or CODEX_MODEL
+
+
 def get_codex_reasoning_effort() -> ReasoningEffort:
     raw = os.environ.get(CODEX_REASONING_ENV_VAR, CODEX_REASONING_EFFORT).strip().lower()
+    model = get_codex_model()
+    max_value = "max" if model.startswith("gpt-5.6") else "xhigh"
     aliases = {
-        "max": ReasoningEffort("max", "xhigh"),
-        "extra": ReasoningEffort("max", "xhigh"),
+        "max": ReasoningEffort("max", max_value),
+        "extra": ReasoningEffort("max", max_value),
         "xhigh": ReasoningEffort("xhigh", "xhigh"),
         "high": ReasoningEffort("high", "high"),
         "medium": ReasoningEffort("medium", "medium"),
@@ -492,6 +505,15 @@ def get_codex_reasoning_effort() -> ReasoningEffort:
             "Use low, medium, high, xhigh, extra, or max."
         )
     return effort
+
+
+def get_codex_verbosity() -> str:
+    raw = os.environ.get(CODEX_VERBOSITY_ENV_VAR, CODEX_VERBOSITY).strip().lower()
+    if raw not in {"low", "medium", "high"}:
+        raise SystemExit(
+            f"Invalid {CODEX_VERBOSITY_ENV_VAR}={raw!r}. Use low, medium, or high."
+        )
+    return raw
 
 
 def parse_prompt_options(prompt_text: str) -> PromptOptions:
@@ -921,7 +943,7 @@ class LiveStatus:
                     rendered.append(ch)
             body.append("".join(rendered))
 
-        status_a = f"model={CODEX_MODEL}"
+        status_a = f"model={get_codex_model()}"
         status_b = f"t={elapsed:5.1f}s"
         status_c = f"mode={CODEX_SANDBOX} reasoning={get_codex_reasoning_effort().label}"
 
@@ -977,12 +999,14 @@ class LiveStatus:
 # =============================================================================
 
 def detect_codex_support() -> CodexSupport:
-    proc = run_cmd([CODEX_BINARY, "exec", "--help"], check=False, capture=True)
-    text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    exec_proc = run_cmd([CODEX_BINARY, "exec", "--help"], check=False, capture=True)
+    root_proc = run_cmd([CODEX_BINARY, "--help"], check=False, capture=True)
+    exec_text = (exec_proc.stdout or "") + "\n" + (exec_proc.stderr or "")
+    root_text = (root_proc.stdout or "") + "\n" + (root_proc.stderr or "")
     return CodexSupport(
-        has_json="--json" in text,
-        has_output_last_message="--output-last-message" in text,
-        has_search="--search" in text,
+        has_json="--json" in exec_text,
+        has_output_last_message="--output-last-message" in exec_text,
+        has_search="--search" in root_text,
     )
 
 
@@ -992,13 +1016,20 @@ def build_codex_command(
     summary_file: Path,
 ) -> List[str]:
     codex_mode = get_codex_mode()
+    codex_model = get_codex_model()
     reasoning_effort = get_codex_reasoning_effort()
-    cmd = [
-        CODEX_BINARY,
+    cmd = [CODEX_BINARY]
+
+    if (CODEX_ENABLE_WEB_SEARCH or options.enable_search) and support.has_search:
+        cmd.append("--search")
+
+    cmd += [
         "exec", "--skip-git-repo-check",
-        "--model", CODEX_MODEL,
+        "--model", codex_model,
         "--sandbox", CODEX_SANDBOX,
         "--config", f"model_reasoning_effort={reasoning_effort.codex_value!r}",
+        "--config", f"model_verbosity={get_codex_verbosity()!r}",
+        "--config", f"background_terminal_max_timeout={CODEX_BACKGROUND_TERMINAL_MAX_TIMEOUT_MS}",
     ]
 
     if codex_mode == "fast":
@@ -1008,9 +1039,6 @@ def build_codex_command(
 
     if CODEX_USE_JSON_IF_AVAILABLE and support.has_json:
         cmd.append("--json")
-
-    if (CODEX_ENABLE_WEB_SEARCH or options.enable_search) and support.has_search:
-        cmd.append("--search")
 
     if support.has_output_last_message:
         cmd += ["--output-last-message", str(summary_file)]
@@ -1930,8 +1958,10 @@ def main() -> int:
     ensure_binary(CODEX_BINARY)
 
     support = detect_codex_support()
+    codex_model = get_codex_model()
     codex_mode = get_codex_mode()
     reasoning_effort = get_codex_reasoning_effort()
+    codex_verbosity = get_codex_verbosity()
     repo = get_repo_root().resolve()
     invocation_cwd = Path.cwd().resolve()
 
@@ -1939,9 +1969,10 @@ def main() -> int:
     print(f"Script: {SCRIPT_PATH}")
     print(f"CWD:    {invocation_cwd}")
     print(f"Repo:   {repo}")
-    print(f"Model:  {CODEX_MODEL}")
+    print(f"Model:  {codex_model}")
     print(f"Mode:   {codex_mode}")
     print(f"Reason: {reasoning_effort.label}")
+    print(f"Verb:   {codex_verbosity}")
     print(f"Remote: {GIT_REMOTE_NAME}")
     print(f"Commit: {COMMIT_MODE}")
     print(
