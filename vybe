@@ -22,7 +22,7 @@ Features:
 - Pushes to remote after apply
 - Repo root resolved from CURRENT WORKING DIRECTORY
 - Filters ignored/generated files from change detection
-- Big low-flicker radar/matrix animation while Codex runs
+- Rotating activity-aware ASCII scenes while Codex runs
 - Static matrix-style panel before input, without breaking typing
 
 Notes:
@@ -115,8 +115,10 @@ MAX_FILE_LIST_WIDTH = 120
 
 SPINNER_INTERVAL = 0.10
 RADAR_INTERVAL = 0.14
-RADAR_WIDTH = 38
-RADAR_HEIGHT = 6
+RADAR_WIDTH = 42
+RADAR_HEIGHT = 7
+SCENE_ROTATION_SECONDS = 10.0
+ACTIVITY_TTL_SECONDS = 30.0
 
 IGNORE_GLOBS = [
     "__pycache__",
@@ -277,6 +279,59 @@ class ReasoningEffort:
     codex_value: str
 
 
+@dataclass(frozen=True)
+class AnimationScene:
+    name: str
+    renderer: str
+    activities: Tuple[str, ...]
+    palette: Tuple[str, ...]
+    seed: int
+
+
+ANIMATION_SCENES: Tuple[AnimationScene, ...] = (
+    AnimationScene("MOONPOOL", "orbit", ("think", "wait"), (CYAN, BLUE, MAGENTA), 11),
+    AnimationScene("ECLIPSE ARRAY", "orbit", ("think", "search"), (MAGENTA, BLUE, WHITE), 23),
+    AnimationScene("TIDAL LOCK", "wave", ("think", "wait"), (BLUE, CYAN, GREEN), 37),
+    AnimationScene("ALGAE TIDE", "wave", ("inspect", "wait"), (GREEN, CYAN, YELLOW), 41),
+    AnimationScene("RAIN TERMINAL", "rain", ("execute", "inspect"), (GREEN, CYAN, BLUE), 53),
+    AnimationScene("ACID RAIN", "rain", ("execute", "verify"), (YELLOW, GREEN, MAGENTA), 67),
+    AnimationScene("SEED VAULT", "garden", ("write", "wait"), (GREEN, YELLOW, CYAN), 71),
+    AnimationScene("ROOFTOP GARDEN", "garden", ("write", "verify"), (GREEN, MAGENTA, CYAN), 83),
+    AnimationScene("ROOT MESH", "roots", ("inspect", "think"), (YELLOW, GREEN, CYAN), 97),
+    AnimationScene("FUNGAL BUS", "roots", ("search", "inspect"), (MAGENTA, GREEN, BLUE), 101),
+    AnimationScene("DNA AFTERDARK", "helix", ("think", "verify"), (MAGENTA, CYAN, WHITE), 113),
+    AnimationScene("TWIN MOONS", "helix", ("think", "write"), (BLUE, WHITE, GREEN), 127),
+    AnimationScene("NIGHT SCANNER", "scan", ("inspect", "search"), (CYAN, GREEN, WHITE), 131),
+    AnimationScene("HORIZON LIDAR", "scan", ("search", "execute"), (MAGENTA, CYAN, BLUE), 149),
+    AnimationScene("SPARK RITUAL", "forge", ("execute", "write"), (YELLOW, RED, MAGENTA), 157),
+    AnimationScene("SOLDER MOON", "forge", ("execute", "verify"), (CYAN, YELLOW, WHITE), 163),
+    AnimationScene("CIRCUIT MOSS", "circuit", ("inspect", "execute"), (GREEN, CYAN, YELLOW), 179),
+    AnimationScene("SOLAR BUS", "circuit", ("write", "git"), (YELLOW, MAGENTA, GREEN), 181),
+    AnimationScene("GREEN DIFF", "diff", ("write", "git"), (GREEN, CYAN, WHITE), 193),
+    AnimationScene("RED SHIFT", "diff", ("git", "verify"), (RED, MAGENTA, CYAN), 211),
+    AnimationScene("SEEKER", "search", ("search", "inspect"), (CYAN, WHITE, GREEN), 223),
+    AnimationScene("SIGNAL HUNT", "search", ("search", "think"), (MAGENTA, BLUE, CYAN), 227),
+    AnimationScene("PULSE CHECK", "verify", ("verify", "execute"), (GREEN, CYAN, WHITE), 239),
+    AnimationScene("TEST GARDEN", "verify", ("verify", "write"), (YELLOW, GREEN, MAGENTA), 251),
+    AnimationScene("CURSOR RITE", "code", ("write", "inspect"), (CYAN, GREEN, WHITE), 263),
+    AnimationScene("MIDNIGHT PATCH", "code", ("write", "git"), (MAGENTA, CYAN, GREEN), 269),
+    AnimationScene("FORKED VINE", "git", ("git", "write"), (GREEN, YELLOW, CYAN), 277),
+    AnimationScene("MERGE ECLIPSE", "git", ("git", "verify"), (MAGENTA, BLUE, GREEN), 281),
+    AnimationScene("COMET TAIL", "comet", ("execute", "search"), (WHITE, CYAN, BLUE), 293),
+    AnimationScene("METEOR QUEUE", "comet", ("execute", "wait"), (YELLOW, MAGENTA, CYAN), 307),
+    AnimationScene("DARK CRYSTAL", "crystal", ("think", "verify"), (MAGENTA, BLUE, WHITE), 311),
+    AnimationScene("QUARTZ BLOOM", "crystal", ("write", "wait"), (CYAN, GREEN, YELLOW), 317),
+    AnimationScene("ARCOLOGY", "skyline", ("write", "think"), (GREEN, CYAN, MAGENTA), 331),
+    AnimationScene("NIGHT GREENHOUSE", "skyline", ("wait", "inspect"), (BLUE, GREEN, YELLOW), 347),
+    AnimationScene("SWARM LANTERN", "swarm", ("search", "think"), (YELLOW, CYAN, MAGENTA), 349),
+    AnimationScene("FIREFLY MESH", "swarm", ("inspect", "wait"), (GREEN, YELLOW, BLUE), 353),
+    AnimationScene("HOURGLASS", "hourglass", ("wait", "verify"), (YELLOW, CYAN, WHITE), 367),
+    AnimationScene("LUNAR CLOCK", "hourglass", ("wait", "think"), (BLUE, MAGENTA, WHITE), 373),
+    AnimationScene("RESONANCE", "rings", ("verify", "execute"), (GREEN, MAGENTA, CYAN), 379),
+    AnimationScene("ORBITAL PING", "rings", ("search", "verify"), (CYAN, BLUE, YELLOW), 389),
+)
+
+
 # =============================================================================
 # ERRORS
 # =============================================================================
@@ -310,6 +365,81 @@ def art_noise_glyph(rng: random.Random) -> str:
     if roll < 0.97:
         return rng.choice(ART_SYMBOL_GLYPHS)
     return rng.choice(ART_EMOJI_GLYPHS)
+
+
+def infer_codex_activity(output: str) -> Optional[str]:
+    """
+    Infer a broad activity from human or JSONL Codex output.
+
+    This is deliberately heuristic: animation choice is ambient UI, so unknown
+    and future event formats simply leave the current activity unchanged.
+    """
+    text = output.lower()
+    activity_patterns = (
+        (
+            "verify",
+            (
+                "pytest", "unittest", "npm test", "pnpm test", "yarn test",
+                "cargo test", "go test", "ruff", "mypy", "typecheck",
+                "type-check", "lint", "test suite", "validation",
+            ),
+        ),
+        (
+            "git",
+            (
+                "git status", "git diff", "git log", "git show",
+                "git commit", "git branch", "git merge",
+            ),
+        ),
+        (
+            "write",
+            (
+                "apply_patch", "file_change", "write_file", "create_file",
+                "edit_file", "patch applied", "updated file",
+            ),
+        ),
+        (
+            "inspect",
+            (
+                "read_file", "list_files", "\"rg ", "\"sed ", "\"cat ",
+                "\"head ", "\"tail ", "\"find ", "\"ls ",
+                "'rg ", "'sed ", "'cat ", "'head ", "'tail ", "'find ",
+                "'ls ",
+            ),
+        ),
+        (
+            "search",
+            (
+                "web_search", "search_query", "image_query", "browser.",
+                "\"search\"", "searched the web",
+            ),
+        ),
+        (
+            "wait",
+            (
+                "wait_agent", "\"wait\"", "waiting for", "still running",
+                "yield_time",
+            ),
+        ),
+        (
+            "execute",
+            (
+                "command_execution", "exec_command", "write_stdin",
+                "shell_command", "terminal.",
+            ),
+        ),
+        (
+            "think",
+            (
+                "\"reasoning\"", "\"analysis\"", "update_plan",
+                "item.started", "turn.started",
+            ),
+        ),
+    )
+    for activity, patterns in activity_patterns:
+        if any(pattern in text for pattern in patterns):
+            return activity
+    return None
 
 
 def banner(title: str) -> None:
@@ -816,7 +946,7 @@ def prompt_retry_saved_prompt(repo: Path) -> str:
 
 class LiveStatus:
     """
-    Multi-line terminal animation with reduced flicker.
+    Activity-aware, rotating ASCII animation with reduced terminal flicker.
     """
 
     def __init__(self, label: str = "Codex is thinking", mode: str = "radar") -> None:
@@ -829,26 +959,23 @@ class LiveStatus:
         self._thread: Optional[threading.Thread] = None
         self._start_time = 0.0
         self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._tick = 0
         self._rng = random.Random()
         self._last_lines: List[str] = []
         self._drawn_once = False
         self._spinner_frames = ["|", "/", "-", "\\"]
-        self._radar_phase = [
-            [self._rng.random() * math.tau for _x in range(RADAR_WIDTH)]
-            for _y in range(RADAR_HEIGHT)
-        ]
-        self._radar_bias = [
-            [self._rng.uniform(-0.9, 0.9) for _x in range(RADAR_WIDTH)]
-            for _y in range(RADAR_HEIGHT)
-        ]
-        self._constellations = [
-            (self._rng.randrange(RADAR_WIDTH), self._rng.randrange(RADAR_HEIGHT))
-            for _ in range(5)
-        ]
+        self._activity = "think"
+        self._activity_updated_at = time.monotonic()
+        self._scene = ANIMATION_SCENES[0]
+        self._scene_started_at = 0.0
 
     def start(self) -> None:
-        self._start_time = time.time()
+        self._start_time = time.monotonic()
+        with self._state_lock:
+            self._activity_updated_at = self._start_time
+            self._select_scene(self._activity)
+            self._scene_started_at = self._start_time
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -897,107 +1024,552 @@ class LiveStatus:
         self._drawn_once = False
 
     def _render_lines(self) -> List[str]:
-        elapsed = time.time() - self._start_time
+        now = time.monotonic()
+        elapsed = max(0.0, now - self._start_time)
         if not supports_ansi() or self.mode == "spinner":
             return self._render_spinner(elapsed)
-        return self._render_radar(elapsed)
+
+        with self._state_lock:
+            activity = self._activity
+            if now - self._activity_updated_at > ACTIVITY_TTL_SECONDS:
+                activity = "think"
+            if now - self._scene_started_at >= SCENE_ROTATION_SECONDS:
+                self._select_scene(activity)
+                self._scene_started_at = now
+            scene = self._scene
+            scene_age = now - self._scene_started_at
+            queue_count = self.queue_count
+            queue_hint = self.queue_hint
+
+        return self._render_scene(
+            elapsed,
+            scene,
+            activity,
+            scene_age,
+            queue_count,
+            queue_hint,
+        )
 
     def _render_spinner(self, elapsed: float) -> List[str]:
         frame = self._spinner_frames[self._tick % len(self._spinner_frames)]
+        with self._state_lock:
+            queue_count = self.queue_count
+            queue_hint = self.queue_hint
         return [
-            f"{DIM}{frame} {self.label}... {elapsed:5.1f}s  pending={self.queue_count}  {self.queue_hint}{RESET}"
+            f"{DIM}{frame} {self.label}... {elapsed:5.1f}s  "
+            f"pending={queue_count}  {queue_hint}{RESET}"
         ]
 
-    def _render_radar(self, elapsed: float) -> List[str]:
+    def _select_scene(self, activity: str) -> None:
+        matching = [
+            scene for scene in ANIMATION_SCENES
+            if activity in scene.activities
+        ]
+        pool = matching if matching and self._rng.random() < 0.82 else list(ANIMATION_SCENES)
+        without_current = [scene for scene in pool if scene.name != self._scene.name]
+        if without_current:
+            pool = without_current
+        different_renderer = [
+            scene for scene in pool
+            if scene.renderer != self._scene.renderer
+        ]
+        if different_renderer:
+            pool = different_renderer
+        self._scene = self._rng.choice(pool)
+
+    @staticmethod
+    def _new_canvas() -> List[List[str]]:
+        return [[" " for _x in range(RADAR_WIDTH)] for _y in range(RADAR_HEIGHT)]
+
+    @staticmethod
+    def _plot(canvas: List[List[str]], x: int, y: int, ch: str) -> None:
+        if 0 <= x < RADAR_WIDTH and 0 <= y < RADAR_HEIGHT:
+            canvas[y][x] = ch
+
+    @classmethod
+    def _write_canvas(
+        cls,
+        canvas: List[List[str]],
+        x: int,
+        y: int,
+        text: str,
+    ) -> None:
+        for offset, ch in enumerate(text):
+            cls._plot(canvas, x + offset, y, ch)
+
+    @classmethod
+    def _draw_line(
+        cls,
+        canvas: List[List[str]],
+        x0: int,
+        y0: int,
+        x1: int,
+        y1: int,
+        ch: str,
+    ) -> None:
+        dx = abs(x1 - x0)
+        sx = 1 if x0 < x1 else -1
+        dy = -abs(y1 - y0)
+        sy = 1 if y0 < y1 else -1
+        error = dx + dy
+        while True:
+            cls._plot(canvas, x0, y0, ch)
+            if x0 == x1 and y0 == y1:
+                break
+            twice_error = 2 * error
+            if twice_error >= dy:
+                error += dy
+                x0 += sx
+            if twice_error <= dx:
+                error += dx
+                y0 += sy
+
+    @staticmethod
+    def _noise(seed: int, x: int, y: int, tick: int = 0) -> int:
+        return (
+            seed * 1103515245
+            + x * 2654435761
+            + y * 2246822519
+            + tick * 3266489917
+        ) & 0x7FFFFFFF
+
+    def _scene_orbit(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
         width = RADAR_WIDTH
         height = RADAR_HEIGHT
-        sweep_x = self._tick % width
-        pulse_y = (self._tick // 2) % height
-        t = float(self._tick)
+        cx = width // 2
+        cy = height // 2
+        radius_x = 13 + scene.seed % 6
+        radius_y = 2 + scene.seed % 2
+        for x in range(cx - radius_x, cx + radius_x + 1):
+            ratio = (x - cx) / radius_x
+            if abs(ratio) > 1:
+                continue
+            y_offset = int(round(radius_y * math.sqrt(max(0.0, 1.0 - ratio * ratio))))
+            self._plot(canvas, x, cy - y_offset, ".")
+            self._plot(canvas, x, cy + y_offset, ".")
+        moon_x = cx + int(radius_x * math.cos(tick * 0.10 + scene.seed))
+        moon_y = cy + int(radius_y * math.sin(tick * 0.10 + scene.seed))
+        self._write_canvas(canvas, cx - 2, cy, "(@@@)")
+        self._plot(canvas, moon_x, moon_y, "O")
+        self._plot(canvas, (moon_x + 11) % width, (moon_y + 3) % height, "*")
 
-        chars: List[List[str]] = []
-        for y in range(height):
-            row: List[str] = []
-            for x in range(width):
-                phase = self._radar_phase[y][x]
-                bias = self._radar_bias[y][x]
-                drift = math.sin(phase + t * 0.20 + x * 0.33)
-                ripple = math.sin((x - y) * 0.48 - t * 0.16 + phase * 0.7)
-                bloom = math.cos((x + y) * 0.35 + t * 0.11 + bias)
-                signal = drift + 0.8 * ripple + 0.6 * bloom + bias * 0.4
+    def _scene_wave(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        for band, base_y in enumerate((1, 3, 5)):
+            for x in range(RADAR_WIDTH):
+                phase = x * (0.22 + (scene.seed % 5) * 0.01)
+                y = base_y + int(round(math.sin(phase + tick * 0.11 + band) * 0.7))
+                self._plot(canvas, x, y, "~" if band != 1 else "=")
+        for x in range(scene.seed % 9, RADAR_WIDTH, 11):
+            self._plot(canvas, x, (tick // 2 + x) % RADAR_HEIGHT, "*")
 
-                ch = " "
-                if signal > 1.55:
-                    ch = "✦"
-                elif signal > 0.95:
-                    ch = "*"
-                elif signal > 0.40:
-                    ch = "•"
-                elif signal > -0.05:
-                    ch = "·"
-                elif signal > -0.60:
-                    ch = "."
+    def _scene_rain(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        speed = 1 + scene.seed % 3
+        for x in range(RADAR_WIDTH):
+            if self._noise(scene.seed, x, 0) % 5 > 2:
+                continue
+            head = (tick * speed // 2 + self._noise(scene.seed, x, 1) % 19) % (RADAR_HEIGHT + 5)
+            for trail, ch in enumerate(("*", "|", ":", ".")):
+                self._plot(canvas, x, head - trail, ch)
+        horizon = RADAR_HEIGHT - 1
+        for x in range(0, RADAR_WIDTH, 2):
+            self._plot(canvas, x, horizon, "_" if (x + tick) % 6 else "~")
 
-                if abs(x - sweep_x) == 0:
-                    ch = "│"
-                elif abs(x - sweep_x) == 1:
-                    ch = "╎"
-                elif abs(x - sweep_x) == 2 and ch == " ":
-                    ch = "·"
+    def _scene_garden(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        ground = RADAR_HEIGHT - 1
+        self._write_canvas(canvas, 0, ground, "_" * RADAR_WIDTH)
+        for index, x in enumerate(range(3 + scene.seed % 4, RADAR_WIDTH, 7)):
+            target = 2 + self._noise(scene.seed, index, 0) % 4
+            growth = min(target, 1 + (tick // 3 + index) % (target + 3))
+            for step in range(growth):
+                self._plot(canvas, x, ground - 1 - step, "|")
+            top = ground - growth
+            if growth >= target:
+                self._write_canvas(canvas, x - 1, top, "\\*/")
+            elif growth > 1:
+                self._plot(canvas, x - 1, top + 1, "/")
+                self._plot(canvas, x + 1, top + 1, "\\")
+        cursor_x = (tick // 2 + scene.seed) % RADAR_WIDTH
+        self._plot(canvas, cursor_x, ground, "+")
 
-                arc_y = int((height - 1) * (0.5 + 0.32 * math.sin(t * 0.14 + x * 0.24)))
-                if y == arc_y and (x + self._tick) % 5 == 0:
-                    ch = "─"
-                if y == (pulse_y + (x // 6)) % height and (x + self._tick) % 9 == 0:
-                    ch = "•"
-                if ch in {"✦", "*", "•"} and (x + y + self._tick) % 23 == 0:
-                    ch = art_noise_glyph(self._rng)
-                row.append(ch)
-            chars.append(row)
+    def _scene_roots(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        hub_x = RADAR_WIDTH // 2 + (scene.seed % 5) - 2
+        self._write_canvas(canvas, hub_x - 2, 0, "[o]")
+        endpoints = (2, 10, 18, 27, 36, 41)
+        for index, end_x in enumerate(endpoints):
+            joint_x = (hub_x + end_x) // 2 + ((scene.seed + index) % 3) - 1
+            self._draw_line(canvas, hub_x, 1, joint_x, 3, "/" if end_x < hub_x else "\\")
+            self._draw_line(canvas, joint_x, 3, end_x, 6, "/" if end_x < joint_x else "\\")
+            self._plot(canvas, joint_x, 3, "o")
+            self._plot(canvas, end_x, 6, ".")
+        pulse = endpoints[(tick // 3) % len(endpoints)]
+        self._plot(canvas, pulse, 6, "*")
 
-        for i, (base_x, base_y) in enumerate(self._constellations):
-            cx = (base_x + self._tick * (i + 1)) % width
-            cy = int((base_y + 1.5 * math.sin(t * 0.12 + i * 1.7)) % height)
-            for dy, dx, mark in [(0, 0, "◉"), (0, 1, "•"), (1, 0, "•")]:
-                yy = cy + dy
-                xx = cx + dx
-                if 0 <= yy < height and 0 <= xx < width:
-                    chars[yy][xx] = mark
+    def _scene_helix(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        center = RADAR_WIDTH // 2
+        span = 14 + scene.seed % 5
+        for y in range(RADAR_HEIGHT):
+            phase = y * 0.95 + tick * 0.13 + scene.seed
+            left = center + int(round(math.sin(phase) * span))
+            right = center - int(round(math.sin(phase) * span))
+            lo, hi = sorted((left, right))
+            for x in range(lo + 1, hi):
+                if (x + y + tick) % 3 == 0:
+                    self._plot(canvas, x, y, "-")
+            self._plot(canvas, left, y, "O")
+            self._plot(canvas, right, y, "o")
 
-        body = []
-        for y, row in enumerate(chars):
-            rendered = []
+    def _scene_scan(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        sweep = (tick + scene.seed) % (RADAR_WIDTH + 8) - 4
+        for y in range(RADAR_HEIGHT):
+            self._plot(canvas, sweep, y, "|")
+            self._plot(canvas, sweep - 1, y, ":")
+        self._write_canvas(canvas, 0, RADAR_HEIGHT - 1, "-" * RADAR_WIDTH)
+        for index in range(8):
+            x = self._noise(scene.seed, index, 0) % RADAR_WIDTH
+            y = 1 + self._noise(scene.seed, index, 1) % (RADAR_HEIGHT - 2)
+            distance = abs(x - sweep)
+            self._plot(canvas, x, y, "O" if distance < 3 else ".")
+        self._write_canvas(canvas, 1, 0, "[SCAN]")
+
+    def _scene_forge(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        furnace_x = RADAR_WIDTH // 2 - 5
+        self._write_canvas(canvas, furnace_x, RADAR_HEIGHT - 2, "/[CORE]\\")
+        self._write_canvas(canvas, furnace_x - 2, RADAR_HEIGHT - 1, "==+====+==")
+        for index in range(18):
+            x_offset = self._noise(scene.seed, index, 0) % 21 - 10
+            age = (tick + self._noise(scene.seed, index, 1) % 31) % 25
+            y = RADAR_HEIGHT - 3 - age // 4
+            x = RADAR_WIDTH // 2 + x_offset + int(math.sin(age + index))
+            self._plot(canvas, x, y, "*" if age < 12 else ".")
+
+    def _scene_circuit(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        nodes: List[Tuple[int, int]] = []
+        for y in (1, 3, 5):
+            shift = (scene.seed + y) % 6
+            for x in range(shift, RADAR_WIDTH, 8):
+                nodes.append((x, y))
+                self._plot(canvas, x, y, "o")
+                if x + 7 < RADAR_WIDTH:
+                    self._write_canvas(canvas, x + 1, y, "-------")
+        for x, y in nodes:
+            if y < 5 and (x + scene.seed) % 3:
+                self._plot(canvas, x, y + 1, "|")
+        pulse_x, pulse_y = nodes[(tick // 2) % len(nodes)]
+        self._plot(canvas, pulse_x, pulse_y, "*")
+
+    def _scene_diff(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        lines = (
+            "+ graft night_bus()",
+            "- drop stale_signal",
+            "+ root.patch(seed)",
+            "@@ moon/garden @@",
+            "+ return bloom",
+            "- fossil_mode = true",
+            "+ grid.feed(sun)",
+            "+ tests: green",
+        )
+        start = (tick // 8 + scene.seed) % len(lines)
+        for y in range(RADAR_HEIGHT):
+            text = lines[(start + y) % len(lines)]
+            self._write_canvas(canvas, 0, y, text[:RADAR_WIDTH])
+        self._plot(canvas, min(len(lines[start]), RADAR_WIDTH - 1), 0, "_")
+
+    def _scene_search(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        source_x = 3
+        source_y = RADAR_HEIGHT // 2
+        target_x = RADAR_WIDTH - 5
+        target_y = 1 + (scene.seed % (RADAR_HEIGHT - 2))
+        self._write_canvas(canvas, 0, source_y, "<O>")
+        self._draw_line(canvas, source_x, source_y, target_x, target_y, ".")
+        self._draw_line(canvas, source_x, source_y, target_x, RADAR_HEIGHT - 1, ":")
+        beam_x = source_x + (tick * 2 + scene.seed) % (target_x - source_x)
+        beam_ratio = (beam_x - source_x) / max(1, target_x - source_x)
+        beam_y = int(round(source_y + (target_y - source_y) * beam_ratio))
+        self._plot(canvas, beam_x, beam_y, "*")
+        self._write_canvas(canvas, target_x - 1, target_y, "[X]")
+
+    def _scene_verify(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        for y in (1, 3, 5):
+            self._write_canvas(canvas, 1, y, "[o]---[o]---[o]---[o]---[o]")
+        step = (tick // 3 + scene.seed) % 15
+        row = (step // 5) * 2 + 1
+        column = 2 + (step % 5) * 6
+        self._plot(canvas, column, row, "*")
+        heartbeat_x = (tick * 2) % RADAR_WIDTH
+        self._plot(canvas, heartbeat_x, 0, "^")
+
+    def _scene_code(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        source = (
+            "def grow(light):",
+            "  roots = map(signal)",
+            "  if moon.is_up():",
+            "    grid.feed(light)",
+            "  return bloom",
+            "",
+            "# patching tomorrow",
+        )
+        reveal = 8 + (tick + scene.seed) % 34
+        for y, line in enumerate(source):
+            self._write_canvas(canvas, 1, y, line[:reveal])
+        cursor_y = min(len(source) - 1, reveal // 7)
+        cursor_x = min(RADAR_WIDTH - 1, 1 + len(source[cursor_y][:reveal]))
+        self._plot(canvas, cursor_x, cursor_y, "_")
+
+    def _scene_git(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        self._write_canvas(canvas, 1, 3, "o-----o-----o-----o-----o-----o")
+        self._draw_line(canvas, 7, 3, 12, 1, "/")
+        self._write_canvas(canvas, 12, 1, "o-----o-----o")
+        self._draw_line(canvas, 24, 1, 31, 3, "\\")
+        self._draw_line(canvas, 13, 3, 18, 5, "\\")
+        self._write_canvas(canvas, 18, 5, "o-----o")
+        self._draw_line(canvas, 24, 5, 31, 3, "/")
+        pulse_x = 1 + ((tick + scene.seed) % 6) * 6
+        self._plot(canvas, pulse_x, 3, "*")
+
+    def _scene_comet(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        head_x = (tick + scene.seed) % (RADAR_WIDTH + 18) - 9
+        head_y = 1 + int(2.4 + 2.0 * math.sin((tick + scene.seed) * 0.09))
+        self._write_canvas(canvas, head_x - 2, head_y, "<O>")
+        for trail in range(3, 20):
+            y = head_y + int(math.sin(trail * 0.7 + tick * 0.1))
+            self._plot(canvas, head_x - trail, y, "=" if trail < 9 else ".")
+        for index in range(9):
+            x = self._noise(scene.seed, index, 2) % RADAR_WIDTH
+            y = self._noise(scene.seed, index, 3) % RADAR_HEIGHT
+            self._plot(canvas, x, y, ".")
+
+    def _scene_crystal(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        bases = (7, 18, 30, 38)
+        for index, x in enumerate(bases):
+            height = 2 + (scene.seed + index) % 4
+            top = RADAR_HEIGHT - 1 - height
+            self._draw_line(canvas, x, RADAR_HEIGHT - 1, x + 2, top, "/")
+            self._draw_line(canvas, x + 4, RADAR_HEIGHT - 1, x + 2, top, "\\")
+            self._plot(canvas, x + 2, top, "^")
+            self._plot(canvas, x + 2, top + 2, "|" if index % 2 else ":")
+        shimmer = bases[(tick // 4) % len(bases)] + 2
+        self._plot(canvas, shimmer, 0, "*")
+        self._write_canvas(canvas, 0, RADAR_HEIGHT - 1, "_" * RADAR_WIDTH)
+
+    def _scene_skyline(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        ground = RADAR_HEIGHT - 1
+        x = 0
+        building = 0
+        while x < RADAR_WIDTH:
+            width = 4 + self._noise(scene.seed, building, 0) % 5
+            height = 2 + self._noise(scene.seed, building, 1) % 4
+            roof = ground - height
+            self._write_canvas(canvas, x, roof, "_" * min(width, RADAR_WIDTH - x))
+            for y in range(roof + 1, ground):
+                self._plot(canvas, x, y, "|")
+                self._plot(canvas, min(RADAR_WIDTH - 1, x + width - 1), y, "|")
+                if y % 2 and x + 2 < RADAR_WIDTH:
+                    self._plot(canvas, x + 2, y, "o" if (tick // 5 + building) % 2 else ".")
+            self._plot(canvas, x + width // 2, roof - 1, "*")
+            x += width + 1
+            building += 1
+        self._write_canvas(canvas, 0, ground, "=" * RADAR_WIDTH)
+
+    def _scene_swarm(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        for index in range(26):
+            phase = tick * 0.08 + index * 1.71 + scene.seed
+            x = int((index * 13 + tick * (1 + index % 3) * 0.3 + scene.seed) % RADAR_WIDTH)
+            y = int((RADAR_HEIGHT - 1) * (0.5 + 0.46 * math.sin(phase)))
+            self._plot(canvas, x, y, "*" if index % 7 == 0 else ".")
+        center_x = RADAR_WIDTH // 2 + int(math.sin(tick * 0.08) * 5)
+        self._write_canvas(canvas, center_x - 2, RADAR_HEIGHT // 2, "[o]")
+
+    def _scene_hourglass(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        center = RADAR_WIDTH // 2
+        self._write_canvas(canvas, center - 8, 0, "+--------------+")
+        self._write_canvas(canvas, center - 8, 6, "+--------------+")
+        for y in range(1, 6):
+            inset = y if y <= 3 else 6 - y
+            self._plot(canvas, center - 8 + inset * 2, y, "\\")
+            self._plot(canvas, center + 7 - inset * 2, y, "/")
+        sand_level = (tick // 4 + scene.seed) % 6
+        for y in range(1, 6):
+            for x in range(center - 5, center + 5):
+                if (self._noise(scene.seed, x, y) + sand_level) % 7 == 0:
+                    self._plot(canvas, x, y, "." if y < 3 else ":")
+        self._plot(canvas, center, 3, "*")
+
+    def _scene_rings(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+        tick: int,
+    ) -> None:
+        cx = RADAR_WIDTH // 2
+        cy = RADAR_HEIGHT // 2
+        pulse = (tick // 3 + scene.seed) % 9
+        for radius_x in (6, 12, 18):
+            radius_y = max(1, radius_x // 6)
+            for x in range(cx - radius_x, cx + radius_x + 1):
+                ratio = (x - cx) / radius_x
+                if abs(ratio) > 1:
+                    continue
+                y_offset = int(round(radius_y * math.sqrt(max(0.0, 1.0 - ratio * ratio))))
+                ch = "*" if abs(radius_x // 2 - pulse) <= 1 else "."
+                self._plot(canvas, x, cy - y_offset, ch)
+                self._plot(canvas, x, cy + y_offset, ch)
+        self._write_canvas(canvas, cx - 1, cy, "[O]")
+
+    def _render_scene_canvas(self, scene: AnimationScene) -> List[List[str]]:
+        canvas = self._new_canvas()
+        renderer = getattr(self, f"_scene_{scene.renderer}")
+        renderer(canvas, scene, self._tick)
+        return canvas
+
+    def _colorize_scene(
+        self,
+        canvas: List[List[str]],
+        scene: AnimationScene,
+    ) -> List[str]:
+        body: List[str] = []
+        bright = set("*@OoOX#^+")
+        faint = set(".:")
+        for y, row in enumerate(canvas):
+            rendered: List[str] = []
             for x, ch in enumerate(row):
-                seed = x * 11 + y * 17 + self._tick * 3
-                if ch in {"◉", "✦"}:
-                    rendered.append(c(ch, art_color(seed)))
-                elif ch in {"•", "*", "+"} or ch in ART_BRIGHT_GLYPHS:
-                    rendered.append(c(ch, art_color(seed + 1)))
-                elif ch in {"│", "╎", "─"}:
-                    rendered.append(c(ch, art_color(seed + 2)))
-                elif ch in {"·", "."}:
-                    if (x + y + self._tick) % 4 == 0:
-                        rendered.append(c(ch, art_color(seed + 3, ART_COLORS[:-1])))
-                    else:
-                        rendered.append(c(ch, DIM))
-                else:
+                if ch == " ":
                     rendered.append(ch)
+                    continue
+                color = scene.palette[
+                    (x * 7 + y * 11 + self._tick // 4 + scene.seed)
+                    % len(scene.palette)
+                ]
+                if ch in bright:
+                    rendered.append(c(ch, BOLD + color))
+                elif ch in faint:
+                    rendered.append(c(ch, DIM + color))
+                else:
+                    rendered.append(c(ch, color))
             body.append("".join(rendered))
+        return body
 
-        status_a = f"model={get_codex_model()}"
-        status_b = f"t={elapsed:5.1f}s"
-        status_c = f"mode={CODEX_SANDBOX} reasoning={get_codex_reasoning_effort().label}"
-
-        top = f"┌{'─' * width}┐"
-        bottom = f"└{'─' * width}┘"
-        title = f"{BOLD}{CYAN} {self.label}{RESET}"
-        meta = f"{DIM}{status_a}  {status_b}  {status_c}{RESET}"
-
+    def _render_scene(
+        self,
+        elapsed: float,
+        scene: AnimationScene,
+        activity: str,
+        scene_age: float,
+        queue_count: int,
+        queue_hint: str,
+    ) -> List[str]:
+        body = self._colorize_scene(self._render_scene_canvas(scene), scene)
+        next_scene = max(0.0, SCENE_ROTATION_SECONDS - scene_age)
+        title = (
+            f"{BOLD}{scene.palette[0]} VYBE//{scene.name}{RESET} "
+            f"{DIM}[{activity.upper()}] {self.label}{RESET}"
+        )
+        meta = (
+            f"{DIM}model={get_codex_model()}  t={elapsed:5.1f}s  "
+            f"next={next_scene:3.1f}s  reasoning={get_codex_reasoning_effort().label}{RESET}"
+        )
+        border_color = scene.palette[1 % len(scene.palette)]
+        top = c("+" + "-" * RADAR_WIDTH + "+", DIM + border_color)
+        bottom = c("+" + "-" * RADAR_WIDTH + "+", DIM + border_color)
         rendered = [title, meta, top]
         for line in body:
-            rendered.append("│" + line + "│")
+            rendered.append(c("|", DIM + border_color) + line + c("|", DIM + border_color))
         rendered.append(bottom)
-        rendered.append(c(f" pending={self.queue_count} :: {self.queue_hint} ", DIM))
+        rendered.append(c(f" pending={queue_count} :: {queue_hint} ", DIM))
         return rendered
 
     def _run(self) -> None:
@@ -1030,9 +1602,22 @@ class LiveStatus:
             self._thread.join(timeout=1.0)
 
     def set_queue_status(self, queue_count: int, hint: Optional[str] = None) -> None:
-        self.queue_count = queue_count
-        if hint is not None:
-            self.queue_hint = hint
+        with self._state_lock:
+            self.queue_count = queue_count
+            if hint is not None:
+                self.queue_hint = hint
+
+    def observe_output(self, output: str) -> None:
+        activity: Optional[str] = None
+        for line in output.splitlines() or [output]:
+            inferred = infer_codex_activity(line)
+            if inferred is not None:
+                activity = inferred
+        if activity is None:
+            return
+        with self._state_lock:
+            self._activity = activity
+            self._activity_updated_at = time.monotonic()
 
 
 # =============================================================================
@@ -1508,13 +2093,13 @@ def run_codex(
     live: Optional[LiveStatus] = None
     queue_input: Optional[QueueInputController] = None
     live = LiveStatus("Codex is thinking", mode="radar")
-    live.start()
     if queue_enabled:
         print(
             "Live prompt controls: Enter stacks, R refines next, "
             "and B starts a Git-backed branch."
         )
         live.set_queue_status(0, prompt_action_hint())
+    live.start()
 
     out_lines: List[str] = []
     assert proc.stdout is not None
@@ -1571,6 +2156,8 @@ def run_codex(
                 line = proc.stdout.readline()
                 if line:
                     out_lines.append(line)
+                    if live is not None:
+                        live.observe_output(line)
                     if show_stream:
                         sys.stdout.write(line)
                         sys.stdout.flush()
@@ -1579,6 +2166,8 @@ def run_codex(
                 tail = proc.stdout.read()
                 if tail:
                     out_lines.append(tail)
+                    if live is not None:
+                        live.observe_output(tail)
                     if show_stream:
                         sys.stdout.write(tail)
                         sys.stdout.flush()

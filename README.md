@@ -45,7 +45,9 @@ vybe
 
 Write the task. For multiline input, end with 4 blank lines.
 
-The tool snapshots the repo, sends the task to `codex`, and keeps the run animation visible. While Codex is working, the live keyboard controls are:
+The tool snapshots the repo, sends the task to `codex`, and keeps the run animation visible. The run display rotates through 40 colored, ASCII-only lunarpunk scenes every 10 seconds. Scene selection loosely follows Codex activity such as inspecting, searching, writing, executing, verifying, and working with Git.
+
+While Codex is working, the live keyboard controls are:
 
 - `Enter` — stack a linear follow-up
 - `R` — refine the active task with a priority correction or constraint
