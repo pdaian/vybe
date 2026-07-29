@@ -1609,6 +1609,7 @@ def sync_remote_tracking_branch(repo: Path, remote_name: str, branch: str, targe
 
 
 def push_branch(repo: Path, branch: str) -> None:
+    return # todo remove
     if not has_remote(repo, GIT_REMOTE_NAME):
         raise SystemExit(f"Git remote {GIT_REMOTE_NAME!r} is not configured.")
 
