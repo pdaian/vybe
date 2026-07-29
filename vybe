@@ -16,6 +16,8 @@ Features:
 - Runs `codex exec` in a temp snapshot of the repo
 - Shows summary + changed files
 - apply / reject / inspect flow
+- Live Enter=stack, R=refine, and B=Git-backed branch controls
+- Deterministic prompt-tree execution with Git graph replay on apply
 - Per-file or single commit mode
 - Pushes to remote after apply
 - Repo root resolved from CURRENT WORKING DIRECTORY
@@ -77,6 +79,7 @@ Please make the requested changes directly in the repository files.
 Keep the solution minimal, correct, production-ready, and consistent with the existing project.
 Do not create caches, build artifacts, test output files, coverage files, or temporary files.
 Avoid __pycache__, .pytest_cache, .mypy_cache, dist, build, coverage outputs, and similar generated files.
+Do not create, switch, merge, or delete Git branches or worktrees; vybe manages execution branches and checkpoints.
 Run relevant non-destructive validation when feasible.
 At the end, provide a concise summary of what changed and any validation performed.
 """
@@ -94,6 +97,18 @@ COMMIT_MODE = "single"   # "per-file" or "single"
 COMMIT_PREFIX = "codex"
 TEMP_GIT_USER_NAME = "vybe"
 TEMP_GIT_USER_EMAIL = "vybe@local"
+TEMP_SNAPSHOT_REF = "refs/vybe/snapshot"
+
+PROMPT_KIND_ROOT = "root"
+PROMPT_KIND_STACK = "stack"
+PROMPT_KIND_REFINE = "refine"
+PROMPT_KIND_BRANCH = "branch"
+PROMPT_KINDS = {
+    PROMPT_KIND_ROOT,
+    PROMPT_KIND_STACK,
+    PROMPT_KIND_REFINE,
+    PROMPT_KIND_BRANCH,
+}
 
 SHOW_FULL_CODEX_STREAM = True
 MAX_FILE_LIST_WIDTH = 120
@@ -200,6 +215,32 @@ class ChangedFile:
     new_abs: Optional[Path]
 
 
+@dataclass(frozen=True)
+class PromptAction:
+    kind: str
+    prompt: str
+
+
+@dataclass(frozen=True)
+class PromptExecutionEvent:
+    event_type: str
+    prompt_kind: str = ""
+    prompt: str = ""
+    summary: str = ""
+    commit_hash: str = ""
+    branch_name: str = ""
+    parent_branch: str = ""
+
+
+@dataclass
+class PromptExecutionTrace:
+    session_tag: str
+    prompt_history: List[str] = field(default_factory=list)
+    summary_history: List[str] = field(default_factory=list)
+    events: List[PromptExecutionEvent] = field(default_factory=list)
+    branch_counter: int = 0
+
+
 @dataclass
 class RunResult:
     prompt: str
@@ -210,17 +251,17 @@ class RunResult:
     working_dir: Path
     prompt_history: List[str] = field(default_factory=list)
     summary_history: List[str] = field(default_factory=list)
+    execution_events: List[PromptExecutionEvent] = field(default_factory=list)
 
 
 @dataclass
 class PromptQueueState:
-    label: str = "queue> "
-    hint: str = "(finish with 4 blank lines to queue another prompt)"
     lines: List[str] = field(default_factory=list)
     blank_streak: int = 0
-    prompts: List[str] = field(default_factory=list)
+    actions: List[PromptAction] = field(default_factory=list)
     prompt_visible: bool = False
     capture_active: bool = False
+    capture_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -782,7 +823,7 @@ class LiveStatus:
         self.label = label
         self.mode = mode
         self.queue_count = 0
-        self.queue_hint = "press Enter to queue follow-up"
+        self.queue_hint = prompt_action_hint()
         self._stop = threading.Event()
         self._pause = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -864,7 +905,7 @@ class LiveStatus:
     def _render_spinner(self, elapsed: float) -> List[str]:
         frame = self._spinner_frames[self._tick % len(self._spinner_frames)]
         return [
-            f"{DIM}{frame} {self.label}... {elapsed:5.1f}s  queued={self.queue_count}  {self.queue_hint}{RESET}"
+            f"{DIM}{frame} {self.label}... {elapsed:5.1f}s  pending={self.queue_count}  {self.queue_hint}{RESET}"
         ]
 
     def _render_radar(self, elapsed: float) -> List[str]:
@@ -956,7 +997,7 @@ class LiveStatus:
         for line in body:
             rendered.append("│" + line + "│")
         rendered.append(bottom)
-        rendered.append(c(f" queued={self.queue_count} :: {self.queue_hint} ", DIM))
+        rendered.append(c(f" pending={self.queue_count} :: {self.queue_hint} ", DIM))
         return rendered
 
     def _run(self) -> None:
@@ -1103,6 +1144,7 @@ def init_temp_git_repo(working_dir: Path) -> None:
     run_cmd(["git", "init"], cwd=working_dir, env=git_env)
     run_cmd(["git", "add", "-A"], cwd=working_dir, env=git_env)
     run_cmd(["git", "commit", "--allow-empty", "-m", "snapshot"], cwd=working_dir, env=git_env)
+    run_cmd(["git", "update-ref", TEMP_SNAPSHOT_REF, "HEAD"], cwd=working_dir, env=git_env)
 
 
 # =============================================================================
@@ -1118,17 +1160,35 @@ def list_paths_recursive(root: Path) -> Dict[str, Path]:
     return result
 
 
-def git_status_entries(working_dir: Path) -> List[Tuple[str, str]]:
+def git_snapshot_diff_entries(working_dir: Path) -> List[Tuple[str, str]]:
     proc = run_cmd(
-        ["git", "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames"],
+        [
+            "git",
+            "diff",
+            "--name-status",
+            "-z",
+            "--no-renames",
+            TEMP_SNAPSHOT_REF,
+            "HEAD",
+            "--",
+        ],
         cwd=working_dir,
     )
     entries: List[Tuple[str, str]] = []
-    for raw in proc.stdout.split("\0"):
-        if not raw:
-            continue
-        status = raw[:2]
-        path = raw[3:].replace("\\", "/")
+    fields = [field for field in proc.stdout.split("\0") if field]
+    idx = 0
+    while idx < len(fields):
+        raw_status = fields[idx]
+        idx += 1
+        if "\t" in raw_status:
+            status, path = raw_status.split("\t", 1)
+        else:
+            if idx >= len(fields):
+                raise CommandError("Could not parse temporary Git diff.")
+            status = raw_status
+            path = fields[idx]
+            idx += 1
+        path = path.replace("\\", "/")
         if path:
             entries.append((status, path))
     return entries
@@ -1140,17 +1200,15 @@ def compute_changed_files(repo: Path, snapshot_dir: Path, working_dir: Path) -> 
     changed: List[ChangedFile] = []
 
     seen: set[str] = set()
-    for status, rel in git_status_entries(working_dir):
+    for status, rel in git_snapshot_diff_entries(working_dir):
         if rel in seen or should_ignore_path(repo, rel):
             continue
         seen.add(rel)
-        if status == "??":
-            changed.append(ChangedFile(rel, "A", None, new_map.get(rel)))
-            continue
-        if "D" in status:
+        status_code = status[:1]
+        if status_code == "D":
             changed.append(ChangedFile(rel, "D", old_map.get(rel), None))
             continue
-        if "A" in status and rel not in old_map:
+        if status_code == "A" and rel not in old_map:
             changed.append(ChangedFile(rel, "A", None, new_map.get(rel)))
             continue
         changed.append(ChangedFile(rel, "M", old_map.get(rel), new_map.get(rel)))
@@ -1283,13 +1341,44 @@ def normalize_summary_paths(summary: str, working_dir: Path) -> str:
     return pattern.sub(replace_abs_path, summary)
 
 
-def maybe_show_queue_prompt(state: PromptQueueState) -> None:
+def prompt_action_label(kind: str) -> str:
+    return {
+        PROMPT_KIND_STACK: "stack",
+        PROMPT_KIND_REFINE: "refine",
+        PROMPT_KIND_BRANCH: "branch",
+    }.get(kind, kind)
+
+
+def prompt_action_hint() -> str:
+    return "[Enter] stack  [R] refine next  [B] branch"
+
+
+def queued_action_status(actions: Sequence[PromptAction]) -> str:
+    counts = {
+        PROMPT_KIND_STACK: 0,
+        PROMPT_KIND_REFINE: 0,
+        PROMPT_KIND_BRANCH: 0,
+    }
+    for action in actions:
+        if action.kind in counts:
+            counts[action.kind] += 1
+    return (
+        f"pending={len(actions)} "
+        f"(stack={counts[PROMPT_KIND_STACK]}, "
+        f"refine={counts[PROMPT_KIND_REFINE]}, "
+        f"branch={counts[PROMPT_KIND_BRANCH]})"
+    )
+
+
+def maybe_show_queue_prompt(state: PromptQueueState, kind: str) -> None:
     if state.prompt_visible or not sys.stdin.isatty():
         return
-    queued_count = len(state.prompts)
-    status = f"queued={queued_count}" if queued_count else "queued=0"
-    print(f"\n[{status}] press Enter again when done to resume animation")
-    print(f"{state.label}{state.hint}")
+    if kind not in {PROMPT_KIND_STACK, PROMPT_KIND_REFINE, PROMPT_KIND_BRANCH}:
+        return
+    state.capture_kind = kind
+    label = prompt_action_label(kind)
+    print(f"\n[{queued_action_status(state.actions)}]")
+    print(f"{label}> (finish with 4 blank lines)")
     state.prompt_visible = True
     state.capture_active = True
 
@@ -1299,21 +1388,25 @@ def finish_queued_prompt(state: PromptQueueState) -> bool:
     while lines and lines[-1] == "":
         lines.pop()
     prompt = "\n".join(lines).strip()
+    kind = state.capture_kind
     state.lines.clear()
     state.blank_streak = 0
     state.prompt_visible = False
     state.capture_active = False
+    state.capture_kind = ""
     if not prompt:
         return False
-    state.prompts.append(prompt)
-    print(f"[queued follow-up prompt #{len(state.prompts)}]")
+    state.actions.append(PromptAction(kind=kind, prompt=prompt))
+    label = prompt_action_label(kind)
+    matching_count = sum(1 for action in state.actions if action.kind == kind)
+    print(f"[queued {label} prompt #{matching_count}]")
     return True
 
 
-def begin_queue_capture(state: PromptQueueState) -> None:
+def begin_queue_capture(state: PromptQueueState, kind: str) -> None:
     if state.capture_active:
         return
-    maybe_show_queue_prompt(state)
+    maybe_show_queue_prompt(state, kind)
 
 
 def consume_queue_input(state: PromptQueueState) -> bool:
@@ -1381,7 +1474,7 @@ def run_codex(
     support: CodexSupport,
     working_dir: Path,
     prompt_text: str,
-) -> Tuple[str, str, List[str]]:
+) -> Tuple[str, str, List[PromptAction]]:
     options = parse_prompt_options(prompt_text)
     if not options.prompt_text:
         raise CommandError("Prompt is empty after removing slash commands.")
@@ -1417,8 +1510,11 @@ def run_codex(
     live = LiveStatus("Codex is thinking", mode="radar")
     live.start()
     if queue_enabled:
-        print("Follow-up prompts entered now will be queued and run automatically.")
-        live.set_queue_status(0, "press Enter to queue follow-up")
+        print(
+            "Live prompt controls: Enter stacks, R refines next, "
+            "and B starts a Git-backed branch."
+        )
+        live.set_queue_status(0, prompt_action_hint())
 
     out_lines: List[str] = []
     assert proc.stdout is not None
@@ -1444,8 +1540,8 @@ def run_codex(
                     if was_capturing and not queue_state.capture_active:
                         if live is not None:
                             live.set_queue_status(
-                                len(queue_state.prompts),
-                                "press Enter to queue another follow-up",
+                                len(queue_state.actions),
+                                prompt_action_hint(),
                             )
                             live.resume()
                         if queue_input is not None:
@@ -1454,10 +1550,19 @@ def run_codex(
                     assert queue_input is not None
                     key = queue_input.read_key()
                     if key in {"\n", "\r"}:
+                        capture_kind = PROMPT_KIND_STACK
+                    elif key in {"r", "R"}:
+                        capture_kind = PROMPT_KIND_REFINE
+                    elif key in {"b", "B"}:
+                        capture_kind = PROMPT_KIND_BRANCH
+                    else:
+                        capture_kind = ""
+
+                    if capture_kind:
                         queue_input.disable_cbreak()
                         if live is not None:
                             live.pause_for_output()
-                        begin_queue_capture(queue_state)
+                        begin_queue_capture(queue_state, capture_kind)
                     elif key:
                         sys.stdout.write("\a")
                         sys.stdout.flush()
@@ -1502,26 +1607,216 @@ def run_codex(
         summary = "(No summary captured.)"
 
     summary = normalize_summary_paths(summary, working_dir)
-    return summary, combined, queue_state.prompts
+    return summary, combined, queue_state.actions
+
+
+def prompt_for_execution(action: PromptAction) -> str:
+    prompt = action.prompt.strip()
+    if action.kind != PROMPT_KIND_REFINE:
+        return prompt
+    lines = prompt.splitlines()
+    directive_count = 0
+    while (
+        directive_count < len(lines)
+        and lines[directive_count].strip().lower() in {"/search", "/plan"}
+    ):
+        directive_count += 1
+    directives = lines[:directive_count]
+    refinement = "\n".join(lines[directive_count:]).strip()
+    body = (
+        "Refine the active task with the correction or constraint below. "
+        "Reconcile it with the work already present in the workspace, revise "
+        "existing changes as needed, and verify the combined result before "
+        "continuing.\n\n"
+        f"{refinement}"
+    )
+    return "\n".join(directives + [body]).strip()
+
+
+def prompt_commit_subject(kind: str, prompt: str) -> str:
+    first_line = next(
+        (line.strip() for line in prompt.splitlines() if line.strip()),
+        "prompt",
+    )
+    first_line = re.sub(r"\s+", " ", first_line)
+    if len(first_line) > 58:
+        first_line = first_line[:55].rstrip() + "..."
+    return f"vybe {prompt_action_label(kind)}: {first_line}"
+
+
+def checkpoint_prompt(
+    working_dir: Path,
+    *,
+    base_commit: str,
+    kind: str,
+    prompt: str,
+    summary: str,
+    subject_prompt: Optional[str] = None,
+) -> str:
+    git_env = build_temp_git_env()
+    run_cmd(
+        ["git", "reset", "--soft", base_commit],
+        cwd=working_dir,
+        env=git_env,
+    )
+    run_cmd(["git", "add", "-A"], cwd=working_dir, env=git_env)
+    subject = prompt_commit_subject(kind, subject_prompt or prompt)
+    body = normalize_summary_text(summary)
+    run_cmd(
+        ["git", "commit", "--allow-empty", "-m", subject, "-m", body],
+        cwd=working_dir,
+        env=git_env,
+    )
+    return run_cmd(["git", "rev-parse", "HEAD"], cwd=working_dir).stdout.strip()
+
+
+def branch_slug(prompt: str) -> str:
+    first_line = next(
+        (line.strip().lower() for line in prompt.splitlines() if line.strip()),
+        "work",
+    )
+    slug = re.sub(r"[^a-z0-9]+", "-", first_line).strip("-")
+    return (slug[:28].rstrip("-") or "work")
+
+
+def next_prompt_branch_name(trace: PromptExecutionTrace, prompt: str) -> str:
+    trace.branch_counter += 1
+    session_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", trace.session_tag).strip("-")
+    return (
+        f"vybe/{session_tag or 'session'}/"
+        f"b{trace.branch_counter:03d}-{branch_slug(prompt)}"
+    )
+
+
+def execute_prompt_branch(
+    support: CodexSupport,
+    working_dir: Path,
+    action: PromptAction,
+    trace: PromptExecutionTrace,
+) -> None:
+    parent_branch = get_current_branch(working_dir)
+    branch_name = next_prompt_branch_name(trace, action.prompt)
+    trace.events.append(
+        PromptExecutionEvent(
+            event_type="branch_start",
+            branch_name=branch_name,
+            parent_branch=parent_branch,
+        )
+    )
+    run_cmd(
+        ["git", "checkout", "-b", branch_name],
+        cwd=working_dir,
+        env=build_temp_git_env(),
+    )
+    execute_prompt_action(support, working_dir, action, trace)
+    run_cmd(
+        ["git", "checkout", parent_branch],
+        cwd=working_dir,
+        env=build_temp_git_env(),
+    )
+    run_cmd(
+        [
+            "git",
+            "merge",
+            "--no-ff",
+            branch_name,
+            "-m",
+            f"vybe merge: {branch_name}",
+        ],
+        cwd=working_dir,
+        env=build_temp_git_env(),
+    )
+    trace.events.append(
+        PromptExecutionEvent(
+            event_type="branch_end",
+            branch_name=branch_name,
+            parent_branch=parent_branch,
+        )
+    )
+
+
+def execute_prompt_action(
+    support: CodexSupport,
+    working_dir: Path,
+    action: PromptAction,
+    trace: PromptExecutionTrace,
+) -> None:
+    if action.kind not in PROMPT_KINDS:
+        raise CommandError(f"Unknown prompt action kind: {action.kind!r}")
+
+    effective_prompt = prompt_for_execution(action)
+    starting_branch = get_current_branch(working_dir)
+    base_commit = run_cmd(
+        ["git", "rev-parse", "HEAD"],
+        cwd=working_dir,
+    ).stdout.strip()
+    summary, _combined, queued_actions = run_codex(
+        support,
+        working_dir,
+        effective_prompt,
+    )
+    ending_branch = get_current_branch(working_dir)
+    if ending_branch != starting_branch:
+        raise CommandError(
+            "Codex changed the temporary Git branch during a managed prompt "
+            f"({starting_branch!r} -> {ending_branch!r}). Ask it to edit and "
+            "validate files without switching branches; use B for vybe-managed "
+            "branch workstreams."
+        )
+    commit_hash = checkpoint_prompt(
+        working_dir,
+        base_commit=base_commit,
+        kind=action.kind,
+        prompt=effective_prompt,
+        subject_prompt=action.prompt,
+        summary=summary,
+    )
+    trace.prompt_history.append(effective_prompt)
+    trace.summary_history.append(summary)
+    trace.events.append(
+        PromptExecutionEvent(
+            event_type="prompt",
+            prompt_kind=action.kind,
+            prompt=effective_prompt,
+            summary=summary,
+            commit_hash=commit_hash,
+        )
+    )
+
+    refinements = [
+        queued for queued in queued_actions if queued.kind == PROMPT_KIND_REFINE
+    ]
+    branches = [
+        queued for queued in queued_actions if queued.kind == PROMPT_KIND_BRANCH
+    ]
+    stacks = [
+        queued for queued in queued_actions if queued.kind == PROMPT_KIND_STACK
+    ]
+
+    for refinement in refinements:
+        execute_prompt_action(support, working_dir, refinement, trace)
+    for branch in branches:
+        execute_prompt_branch(support, working_dir, branch, trace)
+    for stacked in stacks:
+        execute_prompt_action(support, working_dir, stacked, trace)
 
 
 def run_prompt_chain(
     support: CodexSupport,
     working_dir: Path,
     prompt_text: str,
-) -> Tuple[List[str], List[str]]:
-    pending_prompts = [prompt_text]
-    prompt_history: List[str] = []
-    summary_history: List[str] = []
-
-    while pending_prompts:
-        current_prompt = pending_prompts.pop(0)
-        summary, _combined, queued_prompts = run_codex(support, working_dir, current_prompt)
-        prompt_history.append(current_prompt)
-        summary_history.append(summary)
-        pending_prompts.extend(queued_prompts)
-
-    return prompt_history, summary_history
+    trace: Optional[PromptExecutionTrace] = None,
+    initial_kind: str = PROMPT_KIND_ROOT,
+) -> PromptExecutionTrace:
+    if trace is None:
+        trace = PromptExecutionTrace(session_tag=working_dir.parent.name)
+    execute_prompt_action(
+        support,
+        working_dir,
+        PromptAction(kind=initial_kind, prompt=prompt_text),
+        trace,
+    )
+    return trace
 
 
 # =============================================================================
@@ -1582,8 +1877,16 @@ def stage_all(repo: Path) -> None:
     run_cmd(["git", "add", "-A"], cwd=repo)
 
 
-def commit(repo: Path, subject: str, body: Optional[str] = None) -> None:
+def commit(
+    repo: Path,
+    subject: str,
+    body: Optional[str] = None,
+    *,
+    allow_empty: bool = False,
+) -> None:
     cmd = ["git", "commit", "-m", subject]
+    if allow_empty:
+        cmd.append("--allow-empty")
     if body:
         cmd += ["-m", body]
     run_cmd(cmd, cwd=repo)
@@ -1780,7 +2083,188 @@ def make_commit_message(
     return subject, make_commit_body(summary, subject)
 
 
+def result_has_prompt_branches(result: RunResult) -> bool:
+    return any(
+        event.event_type == "branch_start"
+        for event in result.execution_events
+    )
+
+
+def branch_graph_can_be_replayed(repo: Path, result: RunResult) -> bool:
+    submodule_paths = get_submodule_paths(repo)
+    if any(
+        split_repo_relpath(ch.path, submodule_paths)[0]
+        for ch in result.changed_files
+    ):
+        return False
+
+    visible_paths = {ch.path for ch in result.changed_files}
+    snapshot_paths = {
+        path
+        for _status, path in git_snapshot_diff_entries(result.working_dir)
+    }
+    return snapshot_paths == visible_paths
+
+
+def ensure_prompt_branches_available(
+    repo: Path,
+    events: Sequence[PromptExecutionEvent],
+) -> None:
+    branch_names = [
+        event.branch_name
+        for event in events
+        if event.event_type == "branch_start"
+    ]
+    if len(branch_names) != len(set(branch_names)):
+        raise CommandError("Prompt execution produced duplicate Git branch names.")
+
+    collisions: List[str] = []
+    for branch_name in branch_names:
+        proc = run_cmd(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+            cwd=repo,
+            check=False,
+        )
+        if proc.returncode == 0:
+            collisions.append(branch_name)
+    if collisions:
+        joined = ", ".join(collisions)
+        raise CommandError(
+            "Cannot replay the prompt tree because these local branches already "
+            f"exist: {joined}"
+        )
+
+
+def verify_replayed_tree(repo: Path, changed_files: Sequence[ChangedFile]) -> None:
+    mismatches: List[str] = []
+    for ch in changed_files:
+        actual = repo / ch.path
+        expected = ch.new_abs
+        if ch.status == "D":
+            if actual.exists() or actual.is_symlink():
+                mismatches.append(ch.path)
+            continue
+        if expected is None:
+            mismatches.append(ch.path)
+            continue
+        if actual.is_symlink() or expected.is_symlink():
+            if not (
+                actual.is_symlink()
+                and expected.is_symlink()
+                and os.readlink(actual) == os.readlink(expected)
+            ):
+                mismatches.append(ch.path)
+            continue
+        if actual.is_dir() or expected.is_dir():
+            if not (actual.is_dir() and expected.is_dir()):
+                mismatches.append(ch.path)
+            continue
+        if not actual.is_file() or actual.read_bytes() != expected.read_bytes():
+            mismatches.append(ch.path)
+
+    if mismatches:
+        joined = ", ".join(mismatches)
+        raise CommandError(
+            f"Replayed prompt tree does not match the reviewed result: {joined}"
+        )
+
+
+def apply_prompt_graph(repo: Path, result: RunResult) -> None:
+    events = result.execution_events
+    ensure_prompt_branches_available(repo, events)
+    original_branch = get_current_branch(repo)
+    temp_tip = run_cmd(
+        ["git", "rev-parse", "HEAD"],
+        cwd=result.working_dir,
+    ).stdout.strip()
+    run_cmd(
+        [
+            "git",
+            "fetch",
+            "--no-tags",
+            str(result.working_dir),
+            temp_tip,
+        ],
+        cwd=repo,
+    )
+
+    branch_stack: List[str] = []
+    prompt_count = 0
+    branch_count = 0
+    for event in events:
+        if event.event_type == "prompt":
+            run_cmd(
+                ["git", "cherry-pick", "--no-commit", event.commit_hash],
+                cwd=repo,
+            )
+            current_branch = get_current_branch(repo)
+            subject, body = make_commit_message(
+                event.prompt,
+                event.summary,
+                branch=current_branch,
+                temp_root=result.temp_root,
+                summary_history=[event.summary],
+            )
+            commit(repo, subject, body, allow_empty=True)
+            prompt_count += 1
+            continue
+
+        if event.event_type == "branch_start":
+            branch_stack.append(get_current_branch(repo))
+            run_cmd(["git", "checkout", "-b", event.branch_name], cwd=repo)
+            branch_count += 1
+            continue
+
+        if event.event_type == "branch_end":
+            if not branch_stack:
+                raise CommandError("Prompt branch event stream is unbalanced.")
+            child_branch = get_current_branch(repo)
+            if child_branch != event.branch_name:
+                raise CommandError(
+                    "Prompt branch event stream ended a different branch than "
+                    f"it started: {event.branch_name!r} != {child_branch!r}"
+                )
+            parent_branch = branch_stack.pop()
+            run_cmd(["git", "checkout", parent_branch], cwd=repo)
+            run_cmd(
+                [
+                    "git",
+                    "merge",
+                    "--no-ff",
+                    child_branch,
+                    "-m",
+                    f"vybe merge: {child_branch}",
+                ],
+                cwd=repo,
+            )
+            continue
+
+        raise CommandError(f"Unknown prompt execution event: {event.event_type!r}")
+
+    if branch_stack:
+        raise CommandError("Prompt branch event stream did not close every branch.")
+    if get_current_branch(repo) != original_branch:
+        raise CommandError("Prompt graph replay did not return to the original branch.")
+
+    verify_replayed_tree(repo, result.changed_files)
+    push_branch(repo, original_branch)
+    ok(
+        f"Applied {prompt_count} prompt commit(s) across {branch_count} "
+        f"Git branch(es) on {original_branch}"
+    )
+
+
 def apply_result(repo: Path, result: RunResult) -> None:
+    if result_has_prompt_branches(result):
+        if branch_graph_can_be_replayed(repo, result):
+            apply_prompt_graph(repo, result)
+            return
+        warn(
+            "The prompt branch topology cannot be replayed because the result "
+            "contains submodule or filtered-path changes; applying the reviewed "
+            "net diff with the configured commit mode instead."
+        )
+
     submodule_paths = get_submodule_paths(repo)
     changed_repo_paths: set[Path] = set()
     root_changed = False
@@ -1858,6 +2342,25 @@ def print_summary(result: RunResult) -> None:
     banner("SESSION SUMMARY")
     print(result.summary)
 
+    if result_has_prompt_branches(result):
+        banner("PROMPT GIT TREE")
+        graph = run_cmd(
+            [
+                "git",
+                "log",
+                "--graph",
+                "--oneline",
+                "--decorate",
+                f"{TEMP_SNAPSHOT_REF}..HEAD",
+            ],
+            cwd=result.working_dir,
+        ).stdout.rstrip()
+        print(graph or "(No prompt commits.)")
+        print(
+            "\nApplying this result will replay the prompt commits, local "
+            "branches, and merge topology onto the current Git branch."
+        )
+
     banner("CHANGED FILES")
     if not result.changed_files:
         print("(No non-ignored file changes detected.)")
@@ -1911,9 +2414,27 @@ def extend_result(repo: Path, support: CodexSupport, result: RunResult) -> None:
         warn("Extend prompt was empty.")
         return
 
-    prompt_history, summary_history = run_prompt_chain(support, result.working_dir, extra_prompt)
-    result.prompt_history.extend(prompt_history)
-    result.summary_history.extend(summary_history)
+    trace = PromptExecutionTrace(
+        session_tag=result.working_dir.parent.name,
+        prompt_history=list(result.prompt_history),
+        summary_history=list(result.summary_history),
+        events=list(result.execution_events),
+        branch_counter=sum(
+            1
+            for event in result.execution_events
+            if event.event_type == "branch_start"
+        ),
+    )
+    trace = run_prompt_chain(
+        support,
+        result.working_dir,
+        extra_prompt,
+        trace=trace,
+        initial_kind=PROMPT_KIND_STACK,
+    )
+    result.prompt_history = trace.prompt_history
+    result.summary_history = trace.summary_history
+    result.execution_events = trace.events
     result.changed_files = compute_changed_files(repo, result.snapshot_dir, result.working_dir)
     result.prompt = "\n\n".join(result.prompt_history)
     result.summary = format_session_summary(result.summary_history, result.changed_files)
@@ -1996,18 +2517,19 @@ def main() -> int:
             try:
                 ensure_clean_repo(repo)
                 temp_root, snapshot_dir, working_dir = make_temp_snapshot(repo)
-                prompt_history, summary_history = run_prompt_chain(support, working_dir, user_prompt)
+                trace = run_prompt_chain(support, working_dir, user_prompt)
                 changed_files = compute_changed_files(repo, snapshot_dir, working_dir)
 
                 result = RunResult(
-                    prompt="\n\n".join(prompt_history),
-                    summary=format_session_summary(summary_history, changed_files),
+                    prompt="\n\n".join(trace.prompt_history),
+                    summary=format_session_summary(trace.summary_history, changed_files),
                     changed_files=changed_files,
                     temp_root=temp_root,
                     snapshot_dir=snapshot_dir,
                     working_dir=working_dir,
-                    prompt_history=prompt_history,
-                    summary_history=summary_history,
+                    prompt_history=trace.prompt_history,
+                    summary_history=trace.summary_history,
+                    execution_events=trace.events,
                 )
 
                 clear_display()

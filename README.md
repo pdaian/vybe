@@ -12,7 +12,9 @@ Low ceremony. High signal. Snapshot the repo, run the agent, inspect the diff, a
 - includes initialized git submodule contents in that snapshot
 - shows summary and changed files
 - supports inspect / extend / apply / reject flow
-- queues follow-up prompts while Codex is still running, then auto-extends in order
+- accepts stack, refine, and branch prompts while Codex is still running
+- executes refinements first, Git-backed branch workstreams second, and stacked follow-ups last
+- previews the prompt Git graph and replays it into the repository when applied
 - can commit per file or as one commit
 - defaults to a single commit when applying changes
 - applies submodule edits in `single` commit mode by committing submodules first, then the superproject
@@ -43,7 +45,17 @@ vybe
 
 Write the task. For multiline input, end with 4 blank lines.
 
-The tool snapshots the repo, sends the task to `codex`, keeps the run animation visible, and lets you press `Enter` to open multiline follow-up capture while it is still working. Queued prompts run automatically in order before you inspect and decide what lands.
+The tool snapshots the repo, sends the task to `codex`, and keeps the run animation visible. While Codex is working, the live keyboard controls are:
+
+- `Enter` — stack a linear follow-up
+- `R` — refine the active task with a priority correction or constraint
+- `B` — start an additive branch workstream
+
+Each key opens multiline capture; finish the prompt with 4 blank lines. The current `codex exec` process is non-interactive, so a refinement does not interrupt or rewrite the request already in flight. It runs immediately afterward, before branch and stack prompts, and is explicitly told to reconcile the correction with the existing work.
+
+Branch workstreams execute serially so each starts from the latest integrated result. Each workstream runs on a real branch in the temporary snapshot, can itself receive refine, branch, and stack prompts, and is merged back before the next workstream. This provides deterministic additive composition instead of racing agents against the same files. Stacked prompts run after the branches captured for their parent prompt.
+
+Before the decision menu, vybe shows the resulting prompt Git graph. Applying a branched session replays each prompt commit, local `vybe/<session>/...` branch, and merge onto the current repository branch. The local workstream branches are intentionally kept so `git log --graph --all` mirrors the prompt tree. If the result includes submodule edits or paths excluded from review, vybe safely falls back to the existing net-diff apply flow.
 
 If the repo uses initialized submodules, their tracked contents are included in the temp workspace so Codex can inspect and edit them too.
 
