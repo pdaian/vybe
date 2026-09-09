@@ -549,6 +549,22 @@ def ansi_visible_length(text: str) -> int:
     return len(re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text))
 
 
+def truncate_ansi(text: str, width: int) -> str:
+    if ansi_visible_length(text) <= width:
+        return text
+    parts: List[str] = []
+    remaining = max(0, width)
+    for part in re.split(r"(\x1b\[[0-?]*[ -/]*[@-~])", text):
+        if part.startswith("\033["):
+            parts.append(part)
+        else:
+            parts.append(part[:remaining])
+            remaining -= min(remaining, len(part))
+            if remaining == 0:
+                break
+    return "".join(parts) + RESET
+
+
 def banner(title: str) -> None:
     line = "=" * 88
     print(f"\n{line}\n{title}\n{line}")
@@ -574,8 +590,17 @@ def supports_ansi() -> bool:
     return sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
 
 
+def get_terminal_size(default_columns: int = 88) -> os.terminal_size:
+    # Query the live TTY first: Screen can inherit stale COLUMNS/LINES values.
+    try:
+        size = os.get_terminal_size(sys.stdout.fileno())
+    except (AttributeError, OSError, ValueError):
+        return shutil.get_terminal_size(fallback=(default_columns, 24))
+    return os.terminal_size((size.columns or default_columns, size.lines or 24))
+
+
 def get_terminal_columns(default: int = 88) -> int:
-    return shutil.get_terminal_size(fallback=(default, 24)).columns
+    return get_terminal_size(default).columns
 
 
 def wrap_for_display(text: str, width: int) -> str:
@@ -1071,6 +1096,7 @@ class LiveStatus:
         self._rng = random.Random()
         self._last_lines: List[str] = []
         self._drawn_once = False
+        self._full_screen = supports_ansi() and self.mode != "spinner"
         self._spinner_frames = ["|", "/", "-", "\\"]
         self._activity = "think"
         self._activity_updated_at = time.monotonic()
@@ -1095,6 +1121,23 @@ class LiveStatus:
             sys.stdout.write(f"\033[{n}A")
 
     def _paint(self, lines: List[str]) -> None:
+        if self._full_screen:
+            if not self._drawn_once:
+                self._drawn_once = True
+                sys.stdout.write("\033[?1049h\033[?25l")
+            size = get_terminal_size()
+            frame = [truncate_ansi(line, size.columns) for line in lines[:size.lines]]
+            frame.extend([""] * (size.lines - len(frame)))
+            # Disable wrapping too: wide Unicode text can occupy extra cells.
+            sys.stdout.write("\033[?7l\033[H")
+            sys.stdout.write("\r\n".join("\033[2K" + line for line in frame))
+            # No final newline: it would scroll a frame that fills the screen.
+            sys.stdout.write("\033[?7h\r")
+            sys.stdout.flush()
+            self._last_lines = frame
+            self._drawn_once = True
+            return
+
         if not self._drawn_once:
             sys.stdout.write("\n".join(lines))
             sys.stdout.write("\n")
@@ -1121,6 +1164,13 @@ class LiveStatus:
         if not self._drawn_once:
             return
 
+        if self._full_screen:
+            sys.stdout.write("\033[H\033[2J\033[?7h\033[?25h\033[?1049l")
+            sys.stdout.flush()
+            self._last_lines = []
+            self._drawn_once = False
+            return
+
         self._move_up(len(self._last_lines))
         for i in range(len(self._last_lines)):
             sys.stdout.write("\r\033[2K")
@@ -1137,7 +1187,7 @@ class LiveStatus:
     def _render_lines(self) -> List[str]:
         now = time.monotonic()
         elapsed = max(0.0, now - self._start_time)
-        if not supports_ansi() or self.mode == "spinner":
+        if not self._full_screen:
             return self._render_spinner(elapsed)
 
         with self._state_lock:
@@ -1683,6 +1733,9 @@ class LiveStatus:
         for line in body:
             rendered.append(c("|", DIM + border_color) + line + c("|", DIM + border_color))
         rendered.append(bottom)
+        height = get_terminal_size().lines
+        rendered = rendered[:height - 1]
+        rendered.extend([""] * (height - 1 - len(rendered)))
         rendered.append(c(f" pending={queue_count} :: {queue_hint} ", DIM))
         return self._add_activity_sidebar(rendered, feed_messages)
 
@@ -1693,7 +1746,7 @@ class LiveStatus:
     ) -> List[str]:
         left_width = max((ansi_visible_length(line) for line in left_lines), default=0)
         available = get_terminal_columns() - left_width - 2
-        if available < ACTIVITY_SIDEBAR_MIN_WIDTH:
+        if available < ACTIVITY_SIDEBAR_MIN_WIDTH or len(left_lines) < 3:
             return left_lines
 
         panel_width = min(ACTIVITY_SIDEBAR_MAX_WIDTH, available)
@@ -1737,20 +1790,23 @@ class LiveStatus:
         return combined
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            if self._pause.is_set():
-                time.sleep(0.02)
-                continue
+        try:
+            while not self._stop.is_set():
+                if self._pause.is_set():
+                    time.sleep(0.02)
+                    continue
 
-            lines = self._render_lines()
+                lines = self._render_lines()
+                with self._lock:
+                    if self._pause.is_set() or self._stop.is_set():
+                        continue
+                    self._paint(lines)
+
+                self._tick += 1
+                time.sleep(RADAR_INTERVAL if self.mode == "radar" else SPINNER_INTERVAL)
+        finally:
             with self._lock:
-                self._paint(lines)
-
-            self._tick += 1
-            time.sleep(RADAR_INTERVAL if self.mode == "radar" else SPINNER_INTERVAL)
-
-        with self._lock:
-            self._final_clear()
+                self._final_clear()
 
     def pause_for_output(self) -> None:
         self._pause.set()
@@ -2346,8 +2402,12 @@ def run_codex(
                     if live is not None:
                         live.observe_output(line)
                     if show_stream:
+                        if live is not None:
+                            live.pause_for_output()
                         sys.stdout.write(line)
                         sys.stdout.flush()
+                        if live is not None:
+                            live.resume()
 
             if proc.poll() is not None:
                 tail = proc.stdout.read()
@@ -2356,8 +2416,12 @@ def run_codex(
                     if live is not None:
                         live.observe_output(tail)
                     if show_stream:
+                        if live is not None:
+                            live.pause_for_output()
                         sys.stdout.write(tail)
                         sys.stdout.flush()
+                        if live is not None:
+                            live.resume()
                 rc = proc.returncode
                 break
     finally:

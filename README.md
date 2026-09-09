@@ -45,7 +45,7 @@ vybe
 
 Write the task. For multiline input, end with 4 blank lines.
 
-The tool snapshots the repo, sends the task to `codex`, and keeps the run animation visible. The run display rotates through 40 colored, ASCII-only lunarpunk scenes every 10 seconds. Scene selection loosely follows Codex activity such as inspecting, searching, writing, executing, verifying, and working with Git. On sufficiently wide terminals, an IRC-style `#codex-activity` sidebar shows the user-visible reasoning summaries, assistant updates, and coarse tool activity emitted by Codex. It intentionally omits raw commands, tool arguments, and hidden chain-of-thought; on narrow terminals, the existing animation remains unchanged.
+The tool snapshots the repo, sends the task to `codex`, and keeps the run animation visible. The live view fills the terminal height and follows window resizes, including inside GNU Screen, with keyboard controls on the last row. The run display rotates through 40 colored, ASCII-only lunarpunk scenes every 10 seconds. Scene selection loosely follows Codex activity such as inspecting, searching, writing, executing, verifying, and working with Git. On sufficiently wide terminals, an IRC-style `#codex-activity` sidebar fills the height alongside the animation and shows the user-visible reasoning summaries, assistant updates, and coarse tool activity emitted by Codex. It intentionally omits raw commands, tool arguments, and hidden chain-of-thought; on narrow terminals, the sidebar is hidden.
 
 While Codex is working, the live keyboard controls are:
 
