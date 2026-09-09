@@ -23,6 +23,7 @@ Features:
 - Repo root resolved from CURRENT WORKING DIRECTORY
 - Filters ignored/generated files from change detection
 - Rotating activity-aware ASCII scenes while Codex runs
+- IRC-style public activity sidebar on wide terminals
 - Static matrix-style panel before input, without breaking typing
 
 Notes:
@@ -34,6 +35,7 @@ from __future__ import annotations
 
 import difflib
 import fnmatch
+import json
 import math
 import os
 import random
@@ -60,9 +62,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 SCRIPT_PATH = Path(__file__).resolve()
 
 CODEX_BINARY = "codex"
-CODEX_MODEL = "gpt-5.6-sol"
+CODEX_MODEL = "gpt-6-astra"
 CODEX_SANDBOX = "workspace-write"
-CODEX_REASONING_EFFORT = "xhigh"
+CODEX_REASONING_EFFORT = "max"
 CODEX_VERBOSITY = "high"
 CODEX_ENABLE_WEB_SEARCH = True
 CODEX_USE_JSON_IF_AVAILABLE = True
@@ -75,6 +77,7 @@ OPENAI_API_KEY = ""
 
 CODEX_EXTRA_SUFFIX = """
 Run in quality-first mode for ChatGPT Pro / highest-capability usage. Prioritize correctness, completeness, and careful verification over latency, token use, or credit savings.
+Use repository context to resolve routine ambiguities and continue autonomously; ask only when a missing decision would materially change the result.
 Please make the requested changes directly in the repository files.
 Keep the solution minimal, correct, production-ready, and consistent with the existing project.
 Do not create caches, build artifacts, test output files, coverage files, or temporary files.
@@ -119,6 +122,9 @@ RADAR_WIDTH = 42
 RADAR_HEIGHT = 7
 SCENE_ROTATION_SECONDS = 10.0
 ACTIVITY_TTL_SECONDS = 30.0
+ACTIVITY_FEED_LIMIT = 32
+ACTIVITY_SIDEBAR_MIN_WIDTH = 34
+ACTIVITY_SIDEBAR_MAX_WIDTH = 56
 
 IGNORE_GLOBS = [
     "__pycache__",
@@ -277,6 +283,13 @@ class PromptOptions:
 class ReasoningEffort:
     label: str
     codex_value: str
+
+
+@dataclass(frozen=True)
+class ActivityFeedMessage:
+    elapsed: float
+    nick: str
+    text: str
 
 
 @dataclass(frozen=True)
@@ -440,6 +453,100 @@ def infer_codex_activity(output: str) -> Optional[str]:
         if any(pattern in text for pattern in patterns):
             return activity
     return None
+
+
+def describe_codex_activity(activity: str) -> str:
+    return {
+        "execute": "running a workspace command",
+        "git": "checking repository state",
+        "inspect": "inspecting the workspace",
+        "search": "searching for context",
+        "verify": "running validation",
+        "write": "preparing workspace changes",
+        "wait": "waiting on background work",
+        "think": "working through the task",
+    }.get(activity, "working through the task")
+
+
+def sanitize_activity_text(value: object, max_chars: int = 360) -> str:
+    """Return compact, terminal-safe text suitable for the public activity log."""
+    if not isinstance(value, str):
+        return ""
+    without_controls = re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", value)
+    compact = re.sub(r"\s+", " ", without_controls).strip()
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 3].rstrip() + "..."
+
+
+def activity_item_text(item: Dict[str, object]) -> str:
+    for key in ("text", "summary", "message"):
+        text = sanitize_activity_text(item.get(key))
+        if text:
+            return text
+
+    content = item.get("content")
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                text = sanitize_activity_text(part.get("text"))
+                if text:
+                    parts.append(text)
+        return sanitize_activity_text(" ".join(parts))
+    return ""
+
+
+def extract_public_activity_messages(output: str) -> List[Tuple[str, str]]:
+    """
+    Extract user-visible Codex summaries and coarse tool updates from JSONL.
+
+    Commands and tool arguments are deliberately not included: the sidebar is
+    a concise activity log, not a raw transcript or hidden chain-of-thought.
+    """
+    messages: List[Tuple[str, str]] = []
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+
+        event_type = event.get("type")
+        item = event.get("item")
+        if not isinstance(event_type, str) or not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type in {"reasoning", "agent_message", "plan", "plan_update"}:
+            text = activity_item_text(item)
+            if text:
+                messages.append(("codex", text))
+            continue
+
+        if event_type == "item.completed" and item_type == "todo_list":
+            messages.append(("*", "plan updated"))
+            continue
+
+        tool_item_types = {
+            "command_execution",
+            "file_change",
+            "mcp_tool_call",
+            "web_search",
+        }
+        if event_type == "item.started" and item_type in tool_item_types:
+            serialized = json.dumps(item, ensure_ascii=False)
+            activity = infer_codex_activity(serialized) or "execute"
+            messages.append(("*", describe_codex_activity(activity)))
+        elif event_type == "item.completed" and item_type == "file_change":
+            messages.append(("*", "workspace files updated"))
+
+    return messages
+
+
+def ansi_visible_length(text: str) -> int:
+    return len(re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text))
 
 
 def banner(title: str) -> None:
@@ -658,7 +765,7 @@ def get_codex_model() -> str:
 def get_codex_reasoning_effort() -> ReasoningEffort:
     raw = os.environ.get(CODEX_REASONING_ENV_VAR, CODEX_REASONING_EFFORT).strip().lower()
     model = get_codex_model()
-    max_value = "max" if model.startswith("gpt-5.6") else "xhigh"
+    max_value = "max" if model.startswith(("gpt-5.6", "gpt-6-astra")) else "xhigh"
     aliases = {
         "max": ReasoningEffort("max", max_value),
         "extra": ReasoningEffort("max", max_value),
@@ -969,6 +1076,7 @@ class LiveStatus:
         self._activity_updated_at = time.monotonic()
         self._scene = ANIMATION_SCENES[0]
         self._scene_started_at = 0.0
+        self._feed_messages: List[ActivityFeedMessage] = []
 
     def start(self) -> None:
         self._start_time = time.monotonic()
@@ -976,6 +1084,9 @@ class LiveStatus:
             self._activity_updated_at = self._start_time
             self._select_scene(self._activity)
             self._scene_started_at = self._start_time
+            self._feed_messages = [
+                ActivityFeedMessage(0.0, "system", "connected; awaiting updates")
+            ]
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1040,6 +1151,7 @@ class LiveStatus:
             scene_age = now - self._scene_started_at
             queue_count = self.queue_count
             queue_hint = self.queue_hint
+            feed_messages = self._feed_messages[:]
 
         return self._render_scene(
             elapsed,
@@ -1048,6 +1160,7 @@ class LiveStatus:
             scene_age,
             queue_count,
             queue_hint,
+            feed_messages,
         )
 
     def _render_spinner(self, elapsed: float) -> List[str]:
@@ -1551,6 +1664,7 @@ class LiveStatus:
         scene_age: float,
         queue_count: int,
         queue_hint: str,
+        feed_messages: Sequence[ActivityFeedMessage],
     ) -> List[str]:
         body = self._colorize_scene(self._render_scene_canvas(scene), scene)
         next_scene = max(0.0, SCENE_ROTATION_SECONDS - scene_age)
@@ -1570,7 +1684,57 @@ class LiveStatus:
             rendered.append(c("|", DIM + border_color) + line + c("|", DIM + border_color))
         rendered.append(bottom)
         rendered.append(c(f" pending={queue_count} :: {queue_hint} ", DIM))
-        return rendered
+        return self._add_activity_sidebar(rendered, feed_messages)
+
+    def _add_activity_sidebar(
+        self,
+        left_lines: List[str],
+        feed_messages: Sequence[ActivityFeedMessage],
+    ) -> List[str]:
+        left_width = max((ansi_visible_length(line) for line in left_lines), default=0)
+        available = get_terminal_columns() - left_width - 2
+        if available < ACTIVITY_SIDEBAR_MIN_WIDTH:
+            return left_lines
+
+        panel_width = min(ACTIVITY_SIDEBAR_MAX_WIDTH, available)
+        panel_height = len(left_lines)
+        inner_width = panel_width - 2
+        inner_height = max(0, panel_height - 2)
+        title = " #codex-activity "
+        top = "+" + title + "-" * max(0, inner_width - len(title)) + "+"
+        bottom = "+" + "-" * inner_width + "+"
+
+        log_lines: List[str] = []
+        for message in feed_messages:
+            minutes, seconds = divmod(int(message.elapsed), 60)
+            timestamp = f"{minutes:02d}:{seconds:02d}"
+            prefix = f"[{timestamp}] <{message.nick}> "
+            wrapper = textwrap.TextWrapper(
+                width=max(1, inner_width),
+                initial_indent=prefix,
+                subsequent_indent=" " * len(prefix),
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
+            log_lines.extend(wrapper.wrap(message.text) or [prefix.rstrip()])
+
+        visible_log = log_lines[-inner_height:]
+        visible_log = [""] * (inner_height - len(visible_log)) + visible_log
+        border_style = DIM + CYAN
+        sidebar = [c(top, border_style)]
+        for line in visible_log:
+            sidebar.append(
+                c("|", border_style)
+                + c(line.ljust(inner_width), DIM)
+                + c("|", border_style)
+            )
+        sidebar.append(c(bottom, border_style))
+
+        combined: List[str] = []
+        for left, right in zip(left_lines, sidebar):
+            padding = " " * max(0, left_width - ansi_visible_length(left))
+            combined.append(left + padding + "  " + right)
+        return combined
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -1613,11 +1777,34 @@ class LiveStatus:
             inferred = infer_codex_activity(line)
             if inferred is not None:
                 activity = inferred
-        if activity is None:
+        messages = extract_public_activity_messages(output)
+        if activity is None and not messages:
             return
         with self._state_lock:
-            self._activity = activity
-            self._activity_updated_at = time.monotonic()
+            previous_activity = self._activity
+            if activity is not None:
+                self._activity = activity
+                self._activity_updated_at = time.monotonic()
+
+            if not messages and activity is not None and activity != previous_activity:
+                messages = [("*", describe_codex_activity(activity))]
+
+            elapsed = max(0.0, time.monotonic() - self._start_time)
+            for nick, text in messages:
+                clean_nick = sanitize_activity_text(nick, max_chars=12) or "*"
+                clean_text = sanitize_activity_text(text)
+                if not clean_text:
+                    continue
+                candidate = ActivityFeedMessage(elapsed, clean_nick, clean_text)
+                if (
+                    self._feed_messages
+                    and self._feed_messages[-1].nick == candidate.nick
+                    and self._feed_messages[-1].text == candidate.text
+                ):
+                    continue
+                self._feed_messages.append(candidate)
+            if len(self._feed_messages) > ACTIVITY_FEED_LIMIT:
+                self._feed_messages = self._feed_messages[-ACTIVITY_FEED_LIMIT:]
 
 
 # =============================================================================

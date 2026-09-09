@@ -45,7 +45,7 @@ vybe
 
 Write the task. For multiline input, end with 4 blank lines.
 
-The tool snapshots the repo, sends the task to `codex`, and keeps the run animation visible. The run display rotates through 40 colored, ASCII-only lunarpunk scenes every 10 seconds. Scene selection loosely follows Codex activity such as inspecting, searching, writing, executing, verifying, and working with Git.
+The tool snapshots the repo, sends the task to `codex`, and keeps the run animation visible. The run display rotates through 40 colored, ASCII-only lunarpunk scenes every 10 seconds. Scene selection loosely follows Codex activity such as inspecting, searching, writing, executing, verifying, and working with Git. On sufficiently wide terminals, an IRC-style `#codex-activity` sidebar shows the user-visible reasoning summaries, assistant updates, and coarse tool activity emitted by Codex. It intentionally omits raw commands, tool arguments, and hidden chain-of-thought; on narrow terminals, the existing animation remains unchanged.
 
 While Codex is working, the live keyboard controls are:
 
@@ -61,12 +61,12 @@ Before the decision menu, vybe shows the resulting prompt Git graph. Applying a 
 
 If the repo uses initialized submodules, their tracked contents are included in the temp workspace so Codex can inspect and edit them too.
 
-`vybe` defaults to GPT-5.6 Sol with `max` reasoning, high verbosity, web search enabled when supported by the Codex CLI, and Codex `fast_mode` disabled for higher-quality coding runs. For ChatGPT Pro subscription usage, sign in to Codex with ChatGPT rather than relying on an API key.
+`vybe` defaults to GPT-6 Astra with `max` reasoning, high verbosity, web search enabled when supported by the Codex CLI, and Codex `fast_mode` disabled for higher-quality coding runs. For ChatGPT Pro subscription usage, sign in to Codex with ChatGPT rather than relying on an API key.
 
-If your installed Codex CLI does not yet support GPT-5.6, update Codex or override the model:
+If your installed Codex CLI or account does not yet support GPT-6 Astra, update Codex or override the model:
 
 ```bash
-VYBE_CODEX_MODEL=gpt-5.5 vybe
+VYBE_CODEX_MODEL=gpt-5.6-sol vybe
 ```
 
 To trade quality for speed, set `VYBE_CODEX_MODE` before launch:
@@ -89,7 +89,7 @@ VYBE_CODEX_REASONING_EFFORT=max vybe
 
 Accepted reasoning values are `low`, `medium`, `high`, `xhigh`, `extra`, and `max`. If unset, `vybe` defaults to `max`.
 
-For GPT-5.6 models, `max` is passed through as Codex `max`. For older models, `max` maps to Codex `xhigh`, the strongest broadly supported non-GPT-5.6 reasoning effort.
+For GPT-6 Astra and GPT-5.6 models, `max` is passed through as Codex `max`. For older models, `max` maps to Codex `xhigh`, the strongest broadly supported reasoning effort.
 
 To tune default response detail, set `VYBE_CODEX_VERBOSITY`:
 
@@ -129,7 +129,7 @@ Review the generated diff, inspect any changed files, and apply only when the pa
 - `~/github.pat` format: first line GitHub username, second line PAT/token
 - `VYBE_CODEX_MODE` accepts `fast`, `2x`, `slow`, or `normal`
 - `VYBE_CODEX_REASONING_EFFORT` accepts `low`, `medium`, `high`, `xhigh`, `extra`, or `max`
-- `VYBE_CODEX_MODEL` overrides the default `gpt-5.6-sol` model
+- `VYBE_CODEX_MODEL` overrides the default `gpt-6-astra` model
 - `VYBE_CODEX_VERBOSITY` accepts `low`, `medium`, or `high`
 - do not hardcode secrets into the script
 
