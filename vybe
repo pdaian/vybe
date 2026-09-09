@@ -1076,6 +1076,26 @@ def prompt_retry_saved_prompt(repo: Path) -> str:
 # RUN STATUS ANIMATION
 # =============================================================================
 
+def format_elapsed_time(elapsed: float) -> str:
+    """Format elapsed time with five-unit thresholds and fixed 30-day months."""
+    if elapsed <= 5 * 60:
+        return f"{elapsed:.1f}s"
+
+    remaining = int(elapsed)
+    parts: List[str] = []
+    for suffix, unit_seconds in (
+        ("mo", 30 * 24 * 60 * 60),
+        ("d", 24 * 60 * 60),
+        ("h", 60 * 60),
+        ("m", 60),
+    ):
+        if parts or elapsed > 5 * unit_seconds:
+            value, remaining = divmod(remaining, unit_seconds)
+            parts.append(f"{value}{suffix}")
+    parts.append(f"{remaining}s")
+    return " ".join(parts)
+
+
 class LiveStatus:
     """
     Activity-aware, rotating ASCII animation with reduced terminal flicker.
@@ -1219,7 +1239,7 @@ class LiveStatus:
             queue_count = self.queue_count
             queue_hint = self.queue_hint
         return [
-            f"{DIM}{frame} {self.label}... {elapsed:5.1f}s  "
+            f"{DIM}{frame} {self.label}... {format_elapsed_time(elapsed):>6}  "
             f"pending={queue_count}  {queue_hint}{RESET}"
         ]
 
@@ -1723,7 +1743,7 @@ class LiveStatus:
             f"{DIM}[{activity.upper()}] {self.label}{RESET}"
         )
         meta = (
-            f"{DIM}model={get_codex_model()}  t={elapsed:5.1f}s  "
+            f"{DIM}model={get_codex_model()}  t={format_elapsed_time(elapsed):>6}  "
             f"next={next_scene:3.1f}s  reasoning={get_codex_reasoning_effort().label}{RESET}"
         )
         border_color = scene.palette[1 % len(scene.palette)]

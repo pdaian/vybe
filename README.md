@@ -47,6 +47,8 @@ Write the task. For multiline input, end with 4 blank lines.
 
 The tool snapshots the repo, sends the task to `codex`, and keeps the run animation visible. The live view fills the terminal height and follows window resizes, including inside GNU Screen, with keyboard controls on the last row. The run display rotates through 40 colored, ASCII-only lunarpunk scenes every 10 seconds. Scene selection loosely follows Codex activity such as inspecting, searching, writing, executing, verifying, and working with Git. On sufficiently wide terminals, an IRC-style `#codex-activity` sidebar fills the height alongside the animation and shows the user-visible reasoning summaries, assistant updates, and coarse tool activity emitted by Codex. It intentionally omits raw commands, tool arguments, and hidden chain-of-thought; on narrow terminals, the sidebar is hidden.
 
+The query timer shows seconds through five minutes, then minutes and seconds. After more than five hours it shows hours, minutes, and seconds; after more than five days it adds days; after more than five months it adds months. Months use fixed 30-day durations. Longer formats include all smaller units, using whole seconds. The spinner and full-screen status view use the same format.
+
 While Codex is working, the live keyboard controls are:
 
 - `Enter` — stack a linear follow-up
