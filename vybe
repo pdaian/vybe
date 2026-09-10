@@ -1739,7 +1739,15 @@ class LiveStatus:
         queue_count: int,
         queue_hint: str,
     ) -> List[str]:
-        body = self._colorize_scene(self._render_scene_canvas(scene), scene)
+        height = get_terminal_size().lines
+        # Reserve two header rows, two borders, and the keyboard controls.
+        body_height = max(0, height - 5)
+        canvas = self._render_scene_canvas(scene)
+        scaled_canvas = [
+            canvas[y * len(canvas) // body_height]
+            for y in range(body_height)
+        ]
+        body = self._colorize_scene(scaled_canvas, scene)
         next_scene = max(0.0, SCENE_ROTATION_SECONDS - scene_age)
         title = (
             f"{BOLD}{scene.palette[0]} VYBE//{scene.name}{RESET} "
@@ -1756,9 +1764,7 @@ class LiveStatus:
         for line in body:
             rendered.append(c("|", DIM + border_color) + line + c("|", DIM + border_color))
         rendered.append(bottom)
-        height = get_terminal_size().lines
         rendered = rendered[:height - 1]
-        rendered.extend([""] * (height - 1 - len(rendered)))
         rendered.append(c(f" pending={queue_count} :: {queue_hint} ", DIM))
         return self._add_activity_sidebar(rendered)
 
