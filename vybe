@@ -1123,6 +1123,9 @@ class LiveStatus:
         self._scene = ANIMATION_SCENES[0]
         self._scene_started_at = 0.0
         self._feed_messages: List[ActivityFeedMessage] = []
+        self._feed_scroll_offset = 0
+        self._feed_inner_width = 0
+        self._feed_inner_height = 0
 
     def start(self) -> None:
         self._start_time = time.monotonic()
@@ -1133,6 +1136,9 @@ class LiveStatus:
             self._feed_messages = [
                 ActivityFeedMessage(0.0, "system", "connected; awaiting updates")
             ]
+            self._feed_scroll_offset = 0
+            self._feed_inner_width = 0
+            self._feed_inner_height = 0
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1221,7 +1227,6 @@ class LiveStatus:
             scene_age = now - self._scene_started_at
             queue_count = self.queue_count
             queue_hint = self.queue_hint
-            feed_messages = self._feed_messages[:]
 
         return self._render_scene(
             elapsed,
@@ -1230,7 +1235,6 @@ class LiveStatus:
             scene_age,
             queue_count,
             queue_hint,
-            feed_messages,
         )
 
     def _render_spinner(self, elapsed: float) -> List[str]:
@@ -1734,7 +1738,6 @@ class LiveStatus:
         scene_age: float,
         queue_count: int,
         queue_hint: str,
-        feed_messages: Sequence[ActivityFeedMessage],
     ) -> List[str]:
         body = self._colorize_scene(self._render_scene_canvas(scene), scene)
         next_scene = max(0.0, SCENE_ROTATION_SECONDS - scene_age)
@@ -1757,26 +1760,13 @@ class LiveStatus:
         rendered = rendered[:height - 1]
         rendered.extend([""] * (height - 1 - len(rendered)))
         rendered.append(c(f" pending={queue_count} :: {queue_hint} ", DIM))
-        return self._add_activity_sidebar(rendered, feed_messages)
+        return self._add_activity_sidebar(rendered)
 
-    def _add_activity_sidebar(
-        self,
-        left_lines: List[str],
+    @staticmethod
+    def _wrap_activity_log(
         feed_messages: Sequence[ActivityFeedMessage],
+        inner_width: int,
     ) -> List[str]:
-        left_width = max((ansi_visible_length(line) for line in left_lines), default=0)
-        available = get_terminal_columns() - left_width - 2
-        if available < ACTIVITY_SIDEBAR_MIN_WIDTH or len(left_lines) < 3:
-            return left_lines
-
-        panel_width = min(ACTIVITY_SIDEBAR_MAX_WIDTH, available)
-        panel_height = len(left_lines)
-        inner_width = panel_width - 2
-        inner_height = max(0, panel_height - 2)
-        title = " #codex-activity "
-        top = "+" + title + "-" * max(0, inner_width - len(title)) + "+"
-        bottom = "+" + "-" * inner_width + "+"
-
         log_lines: List[str] = []
         for message in feed_messages:
             minutes, seconds = divmod(int(message.elapsed), 60)
@@ -1790,9 +1780,39 @@ class LiveStatus:
                 break_on_hyphens=False,
             )
             log_lines.extend(wrapper.wrap(message.text) or [prefix.rstrip()])
+        return log_lines
 
-        visible_log = log_lines[-inner_height:]
+    def _add_activity_sidebar(self, left_lines: List[str]) -> List[str]:
+        left_width = max((ansi_visible_length(line) for line in left_lines), default=0)
+        available = get_terminal_columns() - left_width - 2
+        if available < ACTIVITY_SIDEBAR_MIN_WIDTH or len(left_lines) < 3:
+            with self._state_lock:
+                self._feed_inner_height = 0
+            return left_lines
+
+        panel_width = min(ACTIVITY_SIDEBAR_MAX_WIDTH, available)
+        panel_height = len(left_lines)
+        inner_width = panel_width - 2
+        inner_height = panel_height - 2
+        title = " #codex-activity "
+        top = "+" + title + "-" * max(0, inner_width - len(title)) + "+"
+
+        with self._state_lock:
+            self._feed_inner_width = inner_width
+            self._feed_inner_height = inner_height
+            log_lines = self._wrap_activity_log(self._feed_messages, inner_width)
+            self._feed_scroll_offset = min(
+                self._feed_scroll_offset,
+                max(0, len(log_lines) - inner_height),
+            )
+            scroll_offset = self._feed_scroll_offset
+            end = len(log_lines) - scroll_offset
+            visible_log = log_lines[max(0, end - inner_height):end]
+
         visible_log = [""] * (inner_height - len(visible_log)) + visible_log
+        position = f"{scroll_offset} up" if scroll_offset else "live"
+        hint = f" Up/Down scroll | {position} "
+        bottom = "+" + hint[:inner_width].ljust(inner_width, "-") + "+"
         border_style = DIM + CYAN
         sidebar = [c(top, border_style)]
         for line in visible_log:
@@ -1847,6 +1867,19 @@ class LiveStatus:
             if hint is not None:
                 self.queue_hint = hint
 
+    def scroll_activity(self, lines: int) -> None:
+        """Scroll up by a number of wrapped lines; zero offset follows updates."""
+        with self._state_lock:
+            if not self._feed_inner_height:
+                return
+            log_lines = self._wrap_activity_log(
+                self._feed_messages, self._feed_inner_width,
+            )
+            max_offset = max(0, len(log_lines) - self._feed_inner_height)
+            self._feed_scroll_offset = max(
+                0, min(max_offset, self._feed_scroll_offset + lines),
+            )
+
     def observe_output(self, output: str) -> None:
         activity: Optional[str] = None
         for line in output.splitlines() or [output]:
@@ -1879,6 +1912,10 @@ class LiveStatus:
                 ):
                     continue
                 self._feed_messages.append(candidate)
+                if self._feed_scroll_offset:
+                    self._feed_scroll_offset += len(
+                        self._wrap_activity_log([candidate], self._feed_inner_width)
+                    )
             if len(self._feed_messages) > ACTIVITY_FEED_LIMIT:
                 self._feed_messages = self._feed_messages[-ACTIVITY_FEED_LIMIT:]
 
@@ -2285,6 +2322,7 @@ class QueueInputController:
         self.fd = fd
         self._attrs: Optional[List[object]] = None
         self._cbreak_enabled = False
+        self._escape_sequence = ""
 
     def enable_cbreak(self) -> None:
         if self._cbreak_enabled:
@@ -2295,6 +2333,7 @@ class QueueInputController:
         self._cbreak_enabled = True
 
     def disable_cbreak(self) -> None:
+        self._escape_sequence = ""
         if not self._cbreak_enabled or self._attrs is None:
             return
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self._attrs)
@@ -2305,7 +2344,32 @@ class QueueInputController:
             data = os.read(self.fd, 1)
         except OSError:
             return ""
-        return data.decode(errors="ignore")
+        key = data.decode(errors="ignore")
+        if not key:
+            return ""
+        if key == "\033":
+            self._escape_sequence = key
+            return ""
+        if self._escape_sequence == "\033" and key not in {"[", "O"}:
+            self._escape_sequence = ""
+            return key
+        if self._escape_sequence:
+            self._escape_sequence += key
+            if self._escape_sequence in {"\033[", "\033O", "\033[["}:
+                return ""
+            # Keep partial terminal sequences across reads, including parameters.
+            if (
+                self._escape_sequence.startswith(("\033[", "\033O"))
+                and "\x20" <= key <= "\x3f"
+            ):
+                return ""
+            sequence = self._escape_sequence
+            self._escape_sequence = ""
+            return {
+                "\033[A": "up", "\033[B": "down",
+                "\033OA": "up", "\033OB": "down",
+            }.get(sequence, "")
+        return key
 
 
 def can_queue_input_during_run() -> bool:
@@ -2406,7 +2470,10 @@ def run_codex(
                     else:
                         capture_kind = ""
 
-                    if capture_kind:
+                    if key in {"up", "down"}:
+                        if live is not None:
+                            live.scroll_activity(1 if key == "up" else -1)
+                    elif capture_kind:
                         queue_input.disable_cbreak()
                         if live is not None:
                             live.pause_for_output()

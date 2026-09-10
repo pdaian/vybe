@@ -54,8 +54,11 @@ While Codex is working, the live keyboard controls are:
 - `Enter` — stack a linear follow-up
 - `R` — refine the active task with a priority correction or constraint
 - `B` — start an additive branch workstream
+- `Up` / `Down` — scroll the activity sidebar one line at a time
 
-Each key opens multiline capture; finish the prompt with 4 blank lines. The current `codex exec` process is non-interactive, so a refinement does not interrupt or rewrite the request already in flight. It runs immediately afterward, before branch and stack prompts, and is explicitly told to reconcile the correction with the existing work.
+The sidebar retains the latest 32 activity messages. Scrolling up holds your place as new updates arrive, until those messages leave the retained history. Scrolling back to the bottom resumes following live updates; the sidebar footer shows whether you are live or how many lines up you have scrolled.
+
+`Enter`, `R`, and `B` each open multiline capture; finish the prompt with 4 blank lines. The current `codex exec` process is non-interactive, so a refinement does not interrupt or rewrite the request already in flight. It runs immediately afterward, before branch and stack prompts, and is explicitly told to reconcile the correction with the existing work.
 
 Branch workstreams execute serially so each starts from the latest integrated result. Each workstream runs on a real branch in the temporary snapshot, can itself receive refine, branch, and stack prompts, and is merged back before the next workstream. This provides deterministic additive composition instead of racing agents against the same files. Stacked prompts run after the branches captured for their parent prompt.
 
