@@ -66,15 +66,15 @@ Before the decision menu, vybe shows the resulting prompt Git graph. Applying a 
 
 If the repo uses initialized submodules, their tracked contents are included in the temp workspace so Codex can inspect and edit them too.
 
-`vybe` defaults to GPT-6 Astra with `max` reasoning, high verbosity, web search enabled when supported by the Codex CLI, and Codex `fast_mode` disabled for higher-quality coding runs. For ChatGPT Pro subscription usage, sign in to Codex with ChatGPT rather than relying on an API key.
+`vybe` defaults to GPT-6 Astra with `max` reasoning, high verbosity, web search enabled when supported by the Codex CLI, and the standard service tier (`service_tier = "default"`, with Codex `fast_mode` disabled). For ChatGPT Pro subscription usage, sign in to Codex with ChatGPT rather than relying on an API key.
 
-If your installed Codex CLI or account does not yet support GPT-6 Astra, update Codex or override the model:
+If your installed Codex CLI or account does not yet support GPT-6 Astra, update Codex or override the model with one available to your account, such as GPT-6.1 Sol:
 
 ```bash
-VYBE_CODEX_MODEL=gpt-5.6-sol vybe
+VYBE_CODEX_MODEL=gpt-6.1-sol vybe
 ```
 
-To trade quality for speed, set `VYBE_CODEX_MODE` before launch:
+To change processing speed, set `VYBE_CODEX_MODE` before launch:
 
 ```bash
 VYBE_CODEX_MODE=fast vybe
@@ -82,7 +82,7 @@ VYBE_CODEX_MODE=2x vybe
 VYBE_CODEX_MODE=slow vybe
 ```
 
-`fast` and `2x` enable Codex `fast_mode`. `slow` disables it. If unset, `vybe` defaults to `slow`.
+`fast` and `2x` enable Codex `fast_mode` and explicitly select `service_tier = "fast"`. `slow` and `normal` disable it and select the standard tier, overriding a saved service-tier preference. If unset, `vybe` defaults to `slow`. Fast mode changes speed and usage, while the model and reasoning effort stay the same; `2x` is an alias, not a guaranteed speed multiplier.
 
 To tune reasoning depth, set `VYBE_CODEX_REASONING_EFFORT`:
 
@@ -90,11 +90,14 @@ To tune reasoning depth, set `VYBE_CODEX_REASONING_EFFORT`:
 VYBE_CODEX_REASONING_EFFORT=high vybe
 VYBE_CODEX_REASONING_EFFORT=xhigh vybe
 VYBE_CODEX_REASONING_EFFORT=max vybe
+VYBE_CODEX_REASONING_EFFORT=ultra vybe
 ```
 
-Accepted reasoning values are `low`, `medium`, `high`, `xhigh`, `extra`, and `max`. If unset, `vybe` defaults to `max`.
+Accepted reasoning values are `low`, `medium`, `high`, `xhigh`, `extra`, `max`, and `ultra`. If unset, `vybe` defaults to `max`.
 
-For GPT-6 Astra and GPT-5.6 models, `max` is passed through as Codex `max`. For older models, `max` maps to Codex `xhigh`, the strongest broadly supported reasoning effort.
+For GPT-6 Astra, GPT-6.1 Sol, GPT-6 Sol, GPT-6 Luna, and GPT-5.6 models (including dated snapshots), `max` is passed through as Codex `max`. For other models, the existing compatibility mapping sends `xhigh`; choose an explicit lower effort if the model requires it. `extra` is an alias for `max`.
+
+`ultra` is passed through unchanged and requires support from your selected model, Codex CLI, and account. It combines maximum reasoning with subagent delegation where supported. GPT-6 Luna supports `max`, but not `ultra`.
 
 To tune default response detail, set `VYBE_CODEX_VERBOSITY`:
 
@@ -103,6 +106,8 @@ VYBE_CODEX_VERBOSITY=high vybe
 VYBE_CODEX_VERBOSITY=medium vybe
 VYBE_CODEX_VERBOSITY=low vybe
 ```
+
+See the official [Codex model guidance](https://learn.chatgpt.com/docs/models), [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference), and [speed settings](https://learn.chatgpt.com/docs/agent-configuration/speed) for current availability and supported parameters.
 
 Applying changes creates commit(s) and pushes them to the configured git remote for the current branch.
 
@@ -133,7 +138,7 @@ Review the generated diff, inspect any changed files, and apply only when the pa
 - git push auth can come from `GIT_REMOTE_USERNAME` / `GIT_REMOTE_TOKEN` in the script, or from `~/github.pat`
 - `~/github.pat` format: first line GitHub username, second line PAT/token
 - `VYBE_CODEX_MODE` accepts `fast`, `2x`, `slow`, or `normal`
-- `VYBE_CODEX_REASONING_EFFORT` accepts `low`, `medium`, `high`, `xhigh`, `extra`, or `max`
+- `VYBE_CODEX_REASONING_EFFORT` accepts `low`, `medium`, `high`, `xhigh`, `extra`, `max`, or `ultra`
 - `VYBE_CODEX_MODEL` overrides the default `gpt-6-astra` model
 - `VYBE_CODEX_VERBOSITY` accepts `low`, `medium`, or `high`
 - do not hardcode secrets into the script

@@ -790,8 +790,11 @@ def get_codex_model() -> str:
 def get_codex_reasoning_effort() -> ReasoningEffort:
     raw = os.environ.get(CODEX_REASONING_ENV_VAR, CODEX_REASONING_EFFORT).strip().lower()
     model = get_codex_model()
-    max_value = "max" if model.startswith(("gpt-5.6", "gpt-6-astra")) else "xhigh"
+    max_models = ("gpt-5.6", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna")
+    supports_max = any(model == name or model.startswith(name + "-") for name in max_models)
+    max_value = "max" if supports_max else "xhigh"
     aliases = {
+        "ultra": ReasoningEffort("ultra", "ultra"),
         "max": ReasoningEffort("max", max_value),
         "extra": ReasoningEffort("max", max_value),
         "xhigh": ReasoningEffort("xhigh", "xhigh"),
@@ -805,7 +808,7 @@ def get_codex_reasoning_effort() -> ReasoningEffort:
     if effort is None:
         raise SystemExit(
             f"Invalid {CODEX_REASONING_ENV_VAR}={raw!r}. "
-            "Use low, medium, high, xhigh, extra, or max."
+            "Use low, medium, high, xhigh, extra, max, or ultra."
         )
     return effort
 
@@ -1965,9 +1968,9 @@ def build_codex_command(
     ]
 
     if codex_mode == "fast":
-        cmd += ["--enable", "fast_mode"]
+        cmd += ["--enable", "fast_mode", "--config", "service_tier='fast'"]
     else:
-        cmd += ["--disable", "fast_mode"]
+        cmd += ["--disable", "fast_mode", "--config", "service_tier='default'"]
 
     if CODEX_USE_JSON_IF_AVAILABLE and support.has_json:
         cmd.append("--json")
