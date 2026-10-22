@@ -34,6 +34,7 @@ Notes:
 from __future__ import annotations
 
 import difflib
+import fcntl
 import fnmatch
 import json
 import math
@@ -43,6 +44,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -51,9 +53,11 @@ import threading
 import time
 import tty
 import termios
-from dataclasses import dataclass, field
+import uuid
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 # =============================================================================
 # CONFIG
@@ -250,6 +254,66 @@ class PromptExecutionTrace:
 
 
 @dataclass
+class SavedPrompt:
+    kind: str
+    prompt: str
+    status: str = "unprocessed"
+    summary: str = ""
+    error: str = ""
+    base_commit: str = ""
+    starting_branch: str = ""
+    commit_hash: str = ""
+    branch_name: str = ""
+    parent_branch: str = ""
+    branch_started: bool = False
+    branch_merged: bool = False
+    children: List[SavedPrompt] = field(default_factory=list)
+
+    def ordered_children(self) -> List[SavedPrompt]:
+        priority = {PROMPT_KIND_REFINE: 0, PROMPT_KIND_BRANCH: 1, PROMPT_KIND_STACK: 2}
+        return sorted(self.children, key=lambda child: priority[child.kind])
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SavedPrompt:
+        if not isinstance(data, dict) or set(data) != {entry.name for entry in fields(cls)}:
+            raise ValueError("Invalid saved prompt fields")
+        if not isinstance(data["children"], list):
+            raise ValueError("Invalid saved prompt children")
+        values = dict(data)
+        values["children"] = [cls.from_dict(child) for child in values["children"]]
+        prompt = cls(**values)
+        for name in (
+            "kind", "prompt", "status", "summary", "error", "base_commit",
+            "starting_branch", "commit_hash", "branch_name", "parent_branch",
+        ):
+            if not isinstance(getattr(prompt, name), str):
+                raise ValueError(f"Invalid saved prompt field: {name}")
+        if prompt.kind not in PROMPT_KINDS or not prompt.prompt.strip():
+            raise ValueError("Invalid saved prompt")
+        if prompt.status not in {"unprocessed", "running", "failed", "returned", "completed"}:
+            raise ValueError("Invalid saved prompt status")
+        if type(prompt.branch_started) is not bool or type(prompt.branch_merged) is not bool:
+            raise ValueError("Invalid saved branch state")
+        if any(child.kind == PROMPT_KIND_ROOT for child in prompt.children):
+            raise ValueError("Invalid nested root prompt")
+        if prompt.status in {"running", "failed", "returned", "completed"} and not (
+            prompt.base_commit and prompt.starting_branch
+        ):
+            raise ValueError("Saved prompt is missing its starting checkpoint")
+        if prompt.status == "completed" and not prompt.commit_hash:
+            raise ValueError("Saved prompt is missing its completed checkpoint")
+        if prompt.branch_started and not (prompt.branch_name and prompt.parent_branch):
+            raise ValueError("Saved branch is missing its names")
+        if prompt.branch_merged and not prompt.branch_started:
+            raise ValueError("Saved branch was merged before it started")
+        if prompt.branch_started and prompt.kind != PROMPT_KIND_BRANCH:
+            raise ValueError("A non-branch prompt has saved branch state")
+        if prompt.branch_merged and prompt.status != "completed":
+            raise ValueError("An unfinished prompt has a merged branch")
+        return prompt
+
+
+@dataclass
 class RunResult:
     prompt: str
     summary: str
@@ -270,6 +334,7 @@ class PromptQueueState:
     prompt_visible: bool = False
     capture_active: bool = False
     capture_kind: str = ""
+    on_queue: Optional[Callable[[PromptAction], None]] = None
 
 
 @dataclass(frozen=True)
@@ -1063,16 +1128,46 @@ def idle_prompt_multiline(label: str, repo: Path) -> str:
 def prompt_retry_saved_prompt(repo: Path) -> str:
     while True:
         choice = idle_prompt_line(
-            "\nSaved prompt. Press Enter to retry, or type discard/quit: ",
+            "\nSession retained. Enter to retry, or type fresh/discard/quit: ",
             repo,
         ).strip().lower()
         if choice in {"", "r", "retry"}:
             return "retry"
         if choice in {"d", "discard"}:
             return "discard"
+        if choice in {"f", "fresh"}:
+            return "fresh"
         if choice in {"q", "quit", "exit"}:
             return "quit"
-        warn("Please press Enter to retry, type discard, or type quit.")
+        warn("Please press Enter to retry, or type fresh, discard, or quit.")
+
+
+def prompt_restore_session(repo: Path, session: PromptSession) -> str:
+    banner("SAVED SESSION")
+    print(f"Recovery files: {session.root}")
+    print(f"Completed prompts: {len(session.trace().prompt_history)}")
+    pending = session.unfinished_prompts()
+    if pending:
+        print("Next unfinished prompt:")
+        print(wrap_for_display(pending[0].prompt, min(80, get_terminal_columns())))
+    else:
+        print("All prompts returned. The saved result is waiting for review.")
+    if session.phase == "applying":
+        warn("Applying was interrupted. Inspect the repository before attempting to apply again.")
+    while True:
+        choice = idle_prompt_line(
+            "Restore saved work and retry unfinished prompts? "
+            "[y]es / [n]o (retry fresh) / [d]iscard / [q]uit: ", repo,
+        ).strip().lower()
+        if choice in {"y", "yes", "r", "restore"}:
+            return "retry"
+        if choice in {"n", "no", "f", "fresh"}:
+            return "fresh"
+        if choice in {"d", "discard"}:
+            return "discard"
+        if choice in {"q", "quit", "exit"}:
+            return "quit"
+        warn("Please choose yes, no, discard, or quit.")
 
 
 # =============================================================================
@@ -1992,9 +2087,8 @@ def build_codex_command(
 # SNAPSHOT / TEMP REPO
 # =============================================================================
 
-def make_temp_snapshot(repo: Path) -> Tuple[Path, Path, Path]:
+def make_temp_snapshot(repo: Path, temp_root: Path) -> Tuple[Path, Path, Path]:
     repo = repo.resolve()
-    temp_root = Path(tempfile.mkdtemp(prefix="codex-run-")).resolve()
     snapshot = (temp_root / "snapshot").resolve()
     working = (temp_root / "working").resolve()
     snapshot.mkdir(parents=True, exist_ok=True)
@@ -2006,10 +2100,6 @@ def make_temp_snapshot(repo: Path) -> Tuple[Path, Path, Path]:
     shutil.copytree(snapshot, working, dirs_exist_ok=False)
     init_temp_git_repo(working)
     return temp_root, snapshot, working
-
-
-def cleanup_temp_dir(temp_root: Path) -> None:
-    shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def archive_git_repo(repo: Path, dest: Path) -> None:
@@ -2039,6 +2129,216 @@ def init_temp_git_repo(working_dir: Path) -> None:
     run_cmd(["git", "add", "-A"], cwd=working_dir, env=git_env)
     run_cmd(["git", "commit", "--allow-empty", "-m", "snapshot"], cwd=working_dir, env=git_env)
     run_cmd(["git", "update-ref", TEMP_SNAPSHOT_REF, "HEAD"], cwd=working_dir, env=git_env)
+
+
+# =============================================================================
+# DURABLE PROMPT RECOVERY
+# =============================================================================
+
+def recovery_root(repo: Path) -> Path:
+    path = Path(run_cmd(["git", "rev-parse", "--git-path", "vybe"], cwd=repo).stdout.strip())
+    return (repo / path).resolve()
+
+
+@contextmanager
+def recovery_lock(root: Path) -> Iterator[int]:
+    # Keep the lock outside the session directory so discarding a session cannot
+    # let another process acquire a different lock while this process is active.
+    fd = os.open(root.with_name("vybe.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CommandError("Another vybe process is using this repository's saved session.") from exc
+        yield lock.fileno()
+
+
+@dataclass
+class PromptSession:
+    repo: Path
+    root: Path
+    session_tag: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    prompts: List[SavedPrompt] = field(default_factory=list)
+    base_head: str = ""
+    base_branch: str = ""
+    branch_counter: int = 0
+    workspace_ready: bool = False
+    phase: str = "pending"
+    lock_fd: Optional[int] = field(default=None, repr=False)
+
+    @property
+    def snapshot_dir(self) -> Path:
+        return self.root / "snapshot"
+
+    @property
+    def working_dir(self) -> Path:
+        return self.root / "working"
+
+    def save(self) -> None:
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        data = {
+            "version": 1,
+            "repo": str(self.repo),
+            "session_tag": self.session_tag,
+            "prompts": [asdict(prompt) for prompt in self.prompts],
+            "base_head": self.base_head,
+            "base_branch": self.base_branch,
+            "branch_counter": self.branch_counter,
+            "workspace_ready": self.workspace_ready,
+            "phase": self.phase,
+        }
+        pending = self.root / "session.json.new"
+        fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(pending, self.root / "session.json")
+        directory_fd = os.open(self.root, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    @classmethod
+    def load(cls, repo: Path, root: Path) -> Optional[PromptSession]:
+        path = root / "session.json"
+        if not path.exists():
+            if root.exists() and any(root.iterdir()):
+                raise CommandError(f"Recovery data has no session manifest. Files retained at {root}")
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or set(data) != {
+                "version", "repo", "session_tag", "prompts", "base_head",
+                "base_branch", "branch_counter", "workspace_ready", "phase",
+            }:
+                raise ValueError("Invalid saved session fields")
+            if data.pop("version") != 1 or data.pop("repo") != str(repo):
+                raise ValueError("Recovery version or repository does not match")
+            if not isinstance(data["prompts"], list):
+                raise ValueError("Invalid saved prompt list")
+            data["prompts"] = [SavedPrompt.from_dict(prompt) for prompt in data["prompts"]]
+            session = cls(repo=repo, root=root, **data)
+            if not re.fullmatch(r"[a-f0-9]{12}", session.session_tag):
+                raise ValueError("Invalid saved session identifier")
+            if session.phase not in {"pending", "review", "applying", "finished"}:
+                raise ValueError("Invalid saved session phase")
+            if type(session.workspace_ready) is not bool:
+                raise ValueError("Invalid saved workspace state")
+            if type(session.branch_counter) is not int or session.branch_counter < 0:
+                raise ValueError("Invalid saved branch counter")
+            if not isinstance(session.base_head, str) or not isinstance(session.base_branch, str):
+                raise ValueError("Invalid saved repository checkpoint")
+            if session.workspace_ready and not (session.base_head and session.base_branch):
+                raise ValueError("Missing saved repository checkpoint")
+            if not session.workspace_ready:
+                pending = list(session.prompts)
+                while pending:
+                    prompt = pending.pop()
+                    if prompt.status != "unprocessed" or prompt.base_commit or prompt.branch_name:
+                        raise ValueError("Saved prompt progress has no initialized workspace")
+                    pending.extend(prompt.children)
+                if session.phase in {"review", "applying"}:
+                    raise ValueError("Saved result has no initialized workspace")
+            return session
+        except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
+            raise CommandError(f"Cannot read saved session: {exc}. Files retained at {root}") from exc
+
+    def add_prompt(self, action: PromptAction, parent: Optional[SavedPrompt] = None) -> SavedPrompt:
+        if action.kind not in PROMPT_KINDS or not action.prompt.strip():
+            raise CommandError("Cannot save an empty or unknown prompt.")
+        prompt = SavedPrompt(kind=action.kind, prompt=action.prompt)
+        (self.prompts if parent is None else parent.children).append(prompt)
+        self.phase = "pending"
+        self.save()
+        return prompt
+
+    def check_repository(self) -> None:
+        ensure_clean_repo(self.repo)
+        if self.base_head and (
+            get_current_branch(self.repo) != self.base_branch
+            or run_cmd(["git", "rev-parse", "HEAD"], cwd=self.repo).stdout.strip() != self.base_head
+        ):
+            raise RetryablePromptError(
+                "The repository branch or HEAD changed since this session started. "
+                "Restore the original checkout before applying saved work, or retry fresh."
+            )
+
+    def prepare_workspace(self) -> None:
+        if self.workspace_ready:
+            if not self.snapshot_dir.is_dir() or not (self.working_dir / ".git").is_dir():
+                raise CommandError(f"Saved workspace is missing. Recovery metadata retained at {self.root}")
+            return
+        self.check_repository()
+        self.base_branch = get_current_branch(self.repo)
+        self.base_head = run_cmd(["git", "rev-parse", "HEAD"], cwd=self.repo).stdout.strip()
+        self.save()
+        # Only incomplete snapshot setup can reach here; no prompt has run yet.
+        for directory in (self.snapshot_dir, self.working_dir):
+            if directory.exists():
+                shutil.rmtree(directory)
+        make_temp_snapshot(self.repo, self.root)
+        self.workspace_ready = True
+        self.save()
+
+    def unfinished_prompts(self) -> List[SavedPrompt]:
+        def collect(prompts: Sequence[SavedPrompt]) -> List[SavedPrompt]:
+            pending: List[SavedPrompt] = []
+            for prompt in prompts:
+                children = collect(prompt.ordered_children())
+                if prompt.status == "completed":
+                    pending.extend(children)
+                else:
+                    pending.append(SavedPrompt(kind=prompt.kind, prompt=prompt.prompt, children=children))
+            return pending
+        return collect(self.prompts)
+
+    def retry_fresh(self) -> None:
+        self.prompts = self.unfinished_prompts()
+        self.base_head = self.base_branch = ""
+        self.workspace_ready = False
+        self.branch_counter = 0
+        self.session_tag = uuid.uuid4().hex[:12]
+        self.phase = "pending"
+        self.save()
+
+    def discard(self) -> None:
+        # If cleanup is interrupted, startup can safely finish it without
+        # offering to reapply an already accepted or rejected session.
+        self.phase = "finished"
+        self.save()
+        shutil.rmtree(self.root)
+
+    def trace(self) -> PromptExecutionTrace:
+        trace = PromptExecutionTrace(session_tag=self.session_tag, branch_counter=self.branch_counter)
+
+        def visit(prompt: SavedPrompt) -> None:
+            if prompt.branch_started:
+                trace.events.append(PromptExecutionEvent(
+                    event_type="branch_start", branch_name=prompt.branch_name,
+                    parent_branch=prompt.parent_branch,
+                ))
+            if prompt.status == "completed":
+                effective_prompt = prompt_for_execution(PromptAction(prompt.kind, prompt.prompt))
+                trace.prompt_history.append(effective_prompt)
+                trace.summary_history.append(prompt.summary)
+                trace.events.append(PromptExecutionEvent(
+                    event_type="prompt", prompt_kind=prompt.kind, prompt=effective_prompt,
+                    summary=prompt.summary, commit_hash=prompt.commit_hash,
+                ))
+            for child in prompt.ordered_children():
+                visit(child)
+            if prompt.branch_merged:
+                trace.events.append(PromptExecutionEvent(
+                    event_type="branch_end", branch_name=prompt.branch_name,
+                    parent_branch=prompt.parent_branch,
+                ))
+
+        for prompt in self.prompts:
+            visit(prompt)
+        return trace
 
 
 # =============================================================================
@@ -2290,7 +2590,10 @@ def finish_queued_prompt(state: PromptQueueState) -> bool:
     state.capture_kind = ""
     if not prompt:
         return False
-    state.actions.append(PromptAction(kind=kind, prompt=prompt))
+    action = PromptAction(kind=kind, prompt=prompt)
+    if state.on_queue is not None:
+        state.on_queue(action)
+    state.actions.append(action)
     label = prompt_action_label(kind)
     matching_count = sum(1 for action in state.actions if action.kind == kind)
     print(f"[queued {label} prompt #{matching_count}]")
@@ -2395,6 +2698,8 @@ def run_codex(
     support: CodexSupport,
     working_dir: Path,
     prompt_text: str,
+    on_queue: Optional[Callable[[PromptAction], None]] = None,
+    lock_fd: Optional[int] = None,
 ) -> Tuple[str, str, List[PromptAction]]:
     options = parse_prompt_options(prompt_text)
     if not options.prompt_text:
@@ -2420,9 +2725,13 @@ def run_codex(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        # A surviving Codex process keeps the recovery lock if vybe is killed.
+        pass_fds=() if lock_fd is None else (lock_fd,),
     )
 
-    queue_state = PromptQueueState()
+    queue_state = PromptQueueState(on_queue=on_queue)
     queue_enabled = can_queue_input_during_run()
     show_stream = SHOW_FULL_CODEX_STREAM and not queue_enabled
 
@@ -2435,13 +2744,13 @@ def run_codex(
             "and B starts a Git-backed branch."
         )
         live.set_queue_status(0, prompt_action_hint())
-    live.start()
 
     out_lines: List[str] = []
     assert proc.stdout is not None
     rc = 0
 
     try:
+        live.start()
         stdout_fd = proc.stdout.fileno()
         stdin_fd = sys.stdin.fileno() if queue_enabled else None
         if stdin_fd is not None:
@@ -2521,18 +2830,42 @@ def run_codex(
                 rc = proc.returncode
                 break
     finally:
+        # Stop the writer before offering recovery or starting another attempt.
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
         if queue_input is not None:
             queue_input.disable_cbreak()
         if live is not None:
             live.stop()
+        proc.stdout.close()
+        if queue_enabled:
+            finalize_queued_input(queue_state)
 
     print("-" * 88)
-    if queue_enabled:
-        finalize_queued_input(queue_state)
 
     combined = "".join(out_lines)
-    if rc != 0:
-        raise CommandError(f"Codex failed with exit code {rc}\n{combined}")
+    failed_turn = False
+    for line in combined.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") in {"error", "turn.failed", "turn.completed"}:
+            failed_turn = event["type"] != "turn.completed"
+    if rc != 0 or failed_turn:
+        reason = f"failed with exit code {rc}" if rc else "reported a failed turn"
+        raise CommandError(f"Codex {reason}\n{combined}")
 
     if summary_file.exists():
         summary = summary_file.read_text(encoding="utf-8", errors="replace").strip()
@@ -2615,144 +2948,130 @@ def branch_slug(prompt: str) -> str:
     return (slug[:28].rstrip("-") or "work")
 
 
-def next_prompt_branch_name(trace: PromptExecutionTrace, prompt: str) -> str:
-    trace.branch_counter += 1
-    session_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", trace.session_tag).strip("-")
+def next_prompt_branch_name(session: PromptSession, prompt: str) -> str:
+    session.branch_counter += 1
+    session_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", session.session_tag).strip("-")
     return (
         f"vybe/{session_tag or 'session'}/"
-        f"b{trace.branch_counter:03d}-{branch_slug(prompt)}"
-    )
-
-
-def execute_prompt_branch(
-    support: CodexSupport,
-    working_dir: Path,
-    action: PromptAction,
-    trace: PromptExecutionTrace,
-) -> None:
-    parent_branch = get_current_branch(working_dir)
-    branch_name = next_prompt_branch_name(trace, action.prompt)
-    trace.events.append(
-        PromptExecutionEvent(
-            event_type="branch_start",
-            branch_name=branch_name,
-            parent_branch=parent_branch,
-        )
-    )
-    run_cmd(
-        ["git", "checkout", "-b", branch_name],
-        cwd=working_dir,
-        env=build_temp_git_env(),
-    )
-    execute_prompt_action(support, working_dir, action, trace)
-    run_cmd(
-        ["git", "checkout", parent_branch],
-        cwd=working_dir,
-        env=build_temp_git_env(),
-    )
-    run_cmd(
-        [
-            "git",
-            "merge",
-            "--no-ff",
-            branch_name,
-            "-m",
-            f"vybe merge: {branch_name}",
-        ],
-        cwd=working_dir,
-        env=build_temp_git_env(),
-    )
-    trace.events.append(
-        PromptExecutionEvent(
-            event_type="branch_end",
-            branch_name=branch_name,
-            parent_branch=parent_branch,
-        )
+        f"b{session.branch_counter:03d}-{branch_slug(prompt)}"
     )
 
 
 def execute_prompt_action(
     support: CodexSupport,
-    working_dir: Path,
-    action: PromptAction,
-    trace: PromptExecutionTrace,
+    session: PromptSession,
+    prompt: SavedPrompt,
 ) -> None:
-    if action.kind not in PROMPT_KINDS:
-        raise CommandError(f"Unknown prompt action kind: {action.kind!r}")
+    if prompt.branch_merged:
+        return
+    working_dir = session.working_dir
+    action = PromptAction(prompt.kind, prompt.prompt)
+    if action.kind == PROMPT_KIND_BRANCH and not prompt.branch_started:
+        if not prompt.branch_name:
+            prompt.branch_name = next_prompt_branch_name(session, action.prompt)
+            prompt.parent_branch = get_current_branch(working_dir)
+            session.save()
+        current_branch = get_current_branch(working_dir)
+        if current_branch == prompt.parent_branch:
+            exists = run_cmd(
+                ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{prompt.branch_name}"],
+                cwd=working_dir, check=False,
+            )
+            if exists.returncode not in {0, 1}:
+                raise CommandError(f"Cannot check saved branch: {exists.stderr}")
+            checkout = ["git", "checkout"]
+            if exists.returncode != 0:
+                checkout.append("-b")
+            run_cmd(
+                checkout + [prompt.branch_name],
+                cwd=working_dir, env=build_temp_git_env(),
+            )
+        elif current_branch != prompt.branch_name:
+            raise CommandError("Saved branch does not match the working checkout.")
+        prompt.branch_started = True
+        session.save()
 
+    if prompt.status != "completed":
+        execute_saved_prompt(support, session, prompt, action)
+    for child in prompt.ordered_children():
+        execute_prompt_action(support, session, child)
+
+    if action.kind == PROMPT_KIND_BRANCH:
+        current_branch = get_current_branch(working_dir)
+        if current_branch == prompt.branch_name:
+            run_cmd(["git", "checkout", prompt.parent_branch], cwd=working_dir, env=build_temp_git_env())
+        elif current_branch != prompt.parent_branch:
+            raise CommandError("Cannot close a saved branch from a different checkout.")
+        # Repeating a merge after a crash is safe: Git sees it is already merged.
+        run_cmd(
+            ["git", "merge", "--no-ff", prompt.branch_name, "-m", f"vybe merge: {prompt.branch_name}"],
+            cwd=working_dir, env=build_temp_git_env(),
+        )
+        prompt.branch_merged = True
+        session.save()
+
+
+def execute_saved_prompt(
+    support: CodexSupport,
+    session: PromptSession,
+    prompt: SavedPrompt,
+    action: PromptAction,
+) -> None:
+    working_dir = session.working_dir
     effective_prompt = prompt_for_execution(action)
-    starting_branch = get_current_branch(working_dir)
-    base_commit = run_cmd(
-        ["git", "rev-parse", "HEAD"],
-        cwd=working_dir,
-    ).stdout.strip()
-    summary, _combined, queued_actions = run_codex(
-        support,
-        working_dir,
-        effective_prompt,
-    )
-    ending_branch = get_current_branch(working_dir)
-    if ending_branch != starting_branch:
+    current_branch = get_current_branch(working_dir)
+    if not prompt.base_commit:
+        prompt.starting_branch = current_branch
+        prompt.base_commit = run_cmd(["git", "rev-parse", "HEAD"], cwd=working_dir).stdout.strip()
+    if current_branch != prompt.starting_branch:
+        raise CommandError("Saved prompt does not match the working checkout; recovery files were retained.")
+
+    if prompt.status != "returned":
+        prompt.status = "running"
+        prompt.error = ""
+        session.save()
+        try:
+            summary, _combined, _queued = run_codex(
+                support, working_dir, effective_prompt,
+                on_queue=lambda queued: session.add_prompt(queued, parent=prompt),
+                lock_fd=session.lock_fd,
+            )
+        except BaseException as exc:
+            prompt.status = "failed"
+            prompt.error = (str(exc) or type(exc).__name__)[-8000:]
+            session.save()
+            raise
+        prompt.summary = summary
+        prompt.status = "returned"
+        session.save()
+
+    if get_current_branch(working_dir) != prompt.starting_branch:
         raise CommandError(
             "Codex changed the temporary Git branch during a managed prompt "
-            f"({starting_branch!r} -> {ending_branch!r}). Ask it to edit and "
-            "validate files without switching branches; use B for vybe-managed "
-            "branch workstreams."
+            "execution. Restore the saved working checkout before retrying."
         )
-    commit_hash = checkpoint_prompt(
+    prompt.commit_hash = checkpoint_prompt(
         working_dir,
-        base_commit=base_commit,
+        base_commit=prompt.base_commit,
         kind=action.kind,
         prompt=effective_prompt,
         subject_prompt=action.prompt,
-        summary=summary,
+        summary=prompt.summary,
     )
-    trace.prompt_history.append(effective_prompt)
-    trace.summary_history.append(summary)
-    trace.events.append(
-        PromptExecutionEvent(
-            event_type="prompt",
-            prompt_kind=action.kind,
-            prompt=effective_prompt,
-            summary=summary,
-            commit_hash=commit_hash,
-        )
-    )
-
-    refinements = [
-        queued for queued in queued_actions if queued.kind == PROMPT_KIND_REFINE
-    ]
-    branches = [
-        queued for queued in queued_actions if queued.kind == PROMPT_KIND_BRANCH
-    ]
-    stacks = [
-        queued for queued in queued_actions if queued.kind == PROMPT_KIND_STACK
-    ]
-
-    for refinement in refinements:
-        execute_prompt_action(support, working_dir, refinement, trace)
-    for branch in branches:
-        execute_prompt_branch(support, working_dir, branch, trace)
-    for stacked in stacks:
-        execute_prompt_action(support, working_dir, stacked, trace)
+    prompt.status = "completed"
+    session.save()
 
 
 def run_prompt_chain(
     support: CodexSupport,
-    working_dir: Path,
-    prompt_text: str,
-    trace: Optional[PromptExecutionTrace] = None,
-    initial_kind: str = PROMPT_KIND_ROOT,
+    session: PromptSession,
 ) -> PromptExecutionTrace:
-    if trace is None:
-        trace = PromptExecutionTrace(session_tag=working_dir.parent.name)
-    execute_prompt_action(
-        support,
-        working_dir,
-        PromptAction(kind=initial_kind, prompt=prompt_text),
-        trace,
-    )
-    return trace
+    session.prepare_workspace()
+    for prompt in session.prompts:
+        execute_prompt_action(support, session, prompt)
+    session.phase = "review"
+    session.save()
+    return session.trace()
 
 
 # =============================================================================
@@ -3327,7 +3646,7 @@ def inspect_loop(result: RunResult, repo: Path) -> None:
             print(f"{idx:>3}. [{ch.status}] {ch.path}")
 
         choice = idle_prompt_line("\nFile number to inspect, or Enter to go back: ", repo).strip()
-        if choice == "":
+        if choice.lower() in {"", "q", "quit", "exit"}:
             return
         if not choice.isdigit():
             warn("Please enter a valid number.")
@@ -3344,71 +3663,152 @@ def inspect_loop(result: RunResult, repo: Path) -> None:
         idle_prompt_line("\nPress Enter to return to inspect menu... ", repo)
 
 
-def extend_result(repo: Path, support: CodexSupport, result: RunResult) -> None:
+def session_result(session: PromptSession) -> RunResult:
+    trace = session.trace()
+    changed_files = compute_changed_files(session.repo, session.snapshot_dir, session.working_dir)
+    return RunResult(
+        prompt="\n\n".join(trace.prompt_history),
+        summary=format_session_summary(trace.summary_history, changed_files),
+        changed_files=changed_files,
+        temp_root=session.root,
+        snapshot_dir=session.snapshot_dir,
+        working_dir=session.working_dir,
+        prompt_history=trace.prompt_history,
+        summary_history=trace.summary_history,
+        execution_events=trace.events,
+    )
+
+
+def extend_result(
+    repo: Path, support: CodexSupport, session: PromptSession, result: RunResult,
+) -> RunResult:
     extra_prompt = idle_prompt_multiline("\nextend> ", repo).strip()
+    if extra_prompt.lower() in {"quit", "exit"}:
+        return result
     if not extra_prompt:
         warn("Extend prompt was empty.")
-        return
+        return result
 
-    trace = PromptExecutionTrace(
-        session_tag=result.working_dir.parent.name,
-        prompt_history=list(result.prompt_history),
-        summary_history=list(result.summary_history),
-        events=list(result.execution_events),
-        branch_counter=sum(
-            1
-            for event in result.execution_events
-            if event.event_type == "branch_start"
-        ),
-    )
-    trace = run_prompt_chain(
-        support,
-        result.working_dir,
-        extra_prompt,
-        trace=trace,
-        initial_kind=PROMPT_KIND_STACK,
-    )
-    result.prompt_history = trace.prompt_history
-    result.summary_history = trace.summary_history
-    result.execution_events = trace.events
-    result.changed_files = compute_changed_files(repo, result.snapshot_dir, result.working_dir)
-    result.prompt = "\n\n".join(result.prompt_history)
-    result.summary = format_session_summary(result.summary_history, result.changed_files)
-
+    session.add_prompt(PromptAction(PROMPT_KIND_STACK, extra_prompt))
+    run_prompt_chain(support, session)
+    result = session_result(session)
     clear_display()
     print_summary(result)
+    return result
 
 
-def decision_loop(repo: Path, support: CodexSupport, result: RunResult) -> None:
+def decision_loop(
+    repo: Path, support: CodexSupport, session: PromptSession, result: RunResult,
+) -> str:
     while True:
         banner("DECISION")
-        choice = idle_prompt_line("[a]pply / [r]eject / [i]nspect / e[x]tend: ", repo).strip().lower()
+        choice = idle_prompt_line(
+            "[a]pply / [r]eject / [i]nspect / e[x]tend / [q]uit (keep saved): ", repo,
+        ).strip().lower()
+
+        if choice in {"q", "quit", "exit"}:
+            return "quit"
 
         if choice in {"i", "inspect"}:
             inspect_loop(result, repo)
             continue
 
         if choice in {"x", "extend"}:
-            extend_result(repo, support, result)
+            if session.phase == "applying":
+                warn("Applying was interrupted. Resolve that attempt before extending the session.")
+                continue
+            result = extend_result(repo, support, session, result)
             continue
 
         if choice in {"r", "reject"}:
-            warn("Rejected. Discarding changes.")
-            return
+            warn("Rejected. Discarding the saved session.")
+            return "done"
 
         if choice in {"a", "apply"}:
             if not result.changed_files:
                 warn("No changes to apply.")
-                return
+                return "done"
+            session.check_repository()
+            session.phase = "applying"
+            session.save()
             apply_result(repo, result)
-            return
+            return "done"
 
-        warn("Please choose apply, reject, inspect, or extend.")
+        warn("Please choose apply, reject, inspect, extend, or quit.")
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
+
+def recover_session(session: PromptSession, choice: str) -> Optional[PromptSession]:
+    if choice == "fresh":
+        session.retry_fresh()
+        if session.prompts:
+            return session
+        info("No unfinished prompts remain.")
+    elif choice != "discard":
+        return session
+    session.discard()
+    return None
+
+
+def prompt_loop(repo: Path, support: CodexSupport, root: Path, lock_fd: int) -> int:
+    session = PromptSession.load(repo, root)
+    if session is not None and session.phase == "finished":
+        shutil.rmtree(root)
+        session = None
+    if session is not None:
+        session.lock_fd = lock_fd
+        choice = prompt_restore_session(repo, session)
+        if choice == "quit":
+            info(f"Session kept at {root}")
+            return 0
+        session = recover_session(session, choice)
+
+    while True:
+        try:
+            if session is not None and session.phase == "finished":
+                if root.exists():
+                    shutil.rmtree(root)
+                session = None
+            if session is None:
+                user_prompt = idle_prompt_multiline("\ncodex> ", repo).strip()
+                if user_prompt.lower() in {"quit", "exit"}:
+                    print("Bye.")
+                    return 0
+                if not user_prompt:
+                    continue
+                session = PromptSession(repo=repo, root=root, lock_fd=lock_fd)
+                session.add_prompt(PromptAction(PROMPT_KIND_ROOT, user_prompt))
+
+            if session.phase != "applying":
+                run_prompt_chain(support, session)
+            result = session_result(session)
+            clear_display()
+            print_summary(result)
+            if decision_loop(repo, support, session, result) == "quit":
+                info(f"Session kept at {root}")
+                return 0
+            session.discard()
+            session = None
+            continue
+        except KeyboardInterrupt:
+            print()
+            info(f"Interrupted. Session kept at {root}")
+            return 130
+        except Exception as exc:
+            banner("GIT BLOCKED" if isinstance(exc, RetryablePromptError) else "ERROR")
+            err(str(exc))
+            info(f"Recovery files retained at {root}")
+
+        if session is None:
+            return 1
+        choice = prompt_retry_saved_prompt(repo)
+        if choice == "quit":
+            return 0
+        session = recover_session(session, choice)
+
 
 def main() -> int:
     ensure_binary("git")
@@ -3440,57 +3840,16 @@ def main() -> int:
     )
     print("\nType quit or exit to stop.")
 
-    while True:
-        user_prompt = idle_prompt_multiline("\ncodex> ", repo).strip()
-        if user_prompt.lower() in {"quit", "exit"}:
-            print("Bye.")
-            return 0
-        if not user_prompt:
-            continue
-
-        while True:
-            temp_root: Optional[Path] = None
-            try:
-                ensure_clean_repo(repo)
-                temp_root, snapshot_dir, working_dir = make_temp_snapshot(repo)
-                trace = run_prompt_chain(support, working_dir, user_prompt)
-                changed_files = compute_changed_files(repo, snapshot_dir, working_dir)
-
-                result = RunResult(
-                    prompt="\n\n".join(trace.prompt_history),
-                    summary=format_session_summary(trace.summary_history, changed_files),
-                    changed_files=changed_files,
-                    temp_root=temp_root,
-                    snapshot_dir=snapshot_dir,
-                    working_dir=working_dir,
-                    prompt_history=trace.prompt_history,
-                    summary_history=trace.summary_history,
-                    execution_events=trace.events,
-                )
-
-                clear_display()
-                print_summary(result)
-                decision_loop(repo, support, result)
-
-            except RetryablePromptError as e:
-                banner("GIT BLOCKED")
-                err(str(e))
-                action = prompt_retry_saved_prompt(repo)
-                if action == "retry":
-                    continue
-                if action == "quit":
-                    print("Bye.")
-                    return 0
-            except CommandError as e:
-                banner("ERROR")
-                err(str(e))
-            except Exception as e:
-                banner("UNEXPECTED ERROR")
-                err(repr(e))
-            finally:
-                if temp_root is not None:
-                    cleanup_temp_dir(temp_root)
-            break
+    try:
+        root = recovery_root(repo)
+        with recovery_lock(root) as lock_fd:
+            return prompt_loop(repo, support, root, lock_fd)
+    except (CommandError, OSError) as exc:
+        err(str(exc))
+        return 1
+    except KeyboardInterrupt:
+        print("\nBye. Any saved session has been retained.")
+        return 130
 
 
 if __name__ == "__main__":

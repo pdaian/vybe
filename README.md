@@ -14,6 +14,7 @@ Low ceremony. High signal. Snapshot the repo, run the agent, inspect the diff, a
 - supports inspect / extend / apply / reject flow
 - accepts stack, refine, and branch prompts while Codex is still running
 - executes refinements first, Git-backed branch workstreams second, and stacked follow-ups last
+- saves submitted prompts and completed work for recovery after errors or restarts
 - previews the prompt Git graph and replays it into the repository when applied
 - can commit per file or as one commit
 - defaults to a single commit when applying changes
@@ -61,6 +62,19 @@ The sidebar retains the latest 32 activity messages. Scrolling up holds your pla
 `Enter`, `R`, and `B` each open multiline capture; finish the prompt with 4 blank lines. The current `codex exec` process is non-interactive, so a refinement does not interrupt or rewrite the request already in flight. It runs immediately afterward, before branch and stack prompts, and is explicitly told to reconcile the correction with the existing work.
 
 Branch workstreams execute serially so each starts from the latest integrated result. Each workstream runs on a real branch in the temporary snapshot, can itself receive refine, branch, and stack prompts, and is merged back before the next workstream. This provides deterministic additive composition instead of racing agents against the same files. Stacked prompts run after the branches captured for their parent prompt.
+
+Submitted prompts are saved as **unprocessed** before execution, including live stack, refine, branch, and extend prompts. Each successful response saves its summary and a Git checkpoint before the next prompt runs. The snapshot, working files, prompt tree, and recovery manifest live in `$(git rev-parse --git-path vybe)` (normally `.git/vybe`), outside the tracked files. Saving uses an atomic manifest replacement. Network errors, quota failures, and interruptions retain completed work, the interrupted prompt's partial edits, and queued follow-ups.
+
+When you restart in the same repository checkout, vybe offers these recovery choices:
+
+- **Yes:** restore the saved session and retry its failed or interrupted prompt, then continue the queue in its original refine / branch / stack order. Completed prompts are not sent to Codex again. If all prompts already completed, return to review.
+- **No (retry fresh):** discard the saved work and completed history, take a new snapshot of the current repository, and run the unfinished prompts with their queued follow-ups. If none remain, start a new session.
+- **Discard:** remove the saved session and start a new one.
+- **Quit:** keep everything saved for later.
+
+After a failure, Enter retries with the saved work; `fresh`, `discard`, and `quit` have the same meanings as above. The decision menu also supports `q` to quit with the result saved. Restoring a session restores its workspace; applying changes to the real repository still uses the normal review and apply menu. Saved data is removed after a successful apply or explicit rejection/discard. Only one vybe process can use a checkout's recovery data at a time.
+
+Applying saved work requires the original repository branch and HEAD and a clean working tree. An interrupted apply keeps its recovery data and requires you to inspect and resolve any partially applied changes; vybe will not silently replay commits onto a changed checkout. Recovery files are local to this checkout and are not included in commits or pushes.
 
 Before the decision menu, vybe shows the resulting prompt Git graph. Applying a branched session replays each prompt commit, local `vybe/<session>/...` branch, and merge onto the current repository branch. The local workstream branches are intentionally kept so `git log --graph --all` mirrors the prompt tree. If the result includes submodule edits or paths excluded from review, vybe safely falls back to the existing net-diff apply flow.
 
