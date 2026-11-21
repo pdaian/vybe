@@ -80,9 +80,9 @@ Before the decision menu, vybe shows the resulting prompt Git graph. Applying a 
 
 If the repo uses initialized submodules, their tracked contents are included in the temp workspace so Codex can inspect and edit them too.
 
-`vybe` defaults to GPT-6 Astra with `max` reasoning, high verbosity, web search enabled when supported by the Codex CLI, and the standard service tier (`service_tier = "default"`, with Codex `fast_mode` disabled). For ChatGPT Pro subscription usage, sign in to Codex with ChatGPT rather than relying on an API key.
+`vybe` defaults to GPT-6.2 Astra with `max` reasoning, high verbosity, web search enabled when supported by the Codex CLI, and the standard service tier (`service_tier = "default"`, with Codex `fast_mode` disabled). For ChatGPT Pro subscription usage, sign in to Codex with ChatGPT rather than relying on an API key.
 
-If your installed Codex CLI or account does not yet support GPT-6 Astra, update Codex or override the model with one available to your account, such as GPT-6.1 Sol:
+If your installed Codex CLI or account does not yet support GPT-6.2 Astra, update Codex or override the model with one available to your account, such as GPT-6.1 Sol:
 
 ```bash
 VYBE_CODEX_MODEL=gpt-6.1-sol vybe
@@ -109,7 +109,7 @@ VYBE_CODEX_REASONING_EFFORT=ultra vybe
 
 Accepted reasoning values are `low`, `medium`, `high`, `xhigh`, `extra`, `max`, and `ultra`. If unset, `vybe` defaults to `max`.
 
-For GPT-6 Astra, GPT-6.1 Sol, GPT-6 Sol, GPT-6 Luna, and GPT-5.6 models (including dated snapshots), `max` is passed through as Codex `max`. For other models, the existing compatibility mapping sends `xhigh`; choose an explicit lower effort if the model requires it. `extra` is an alias for `max`.
+For GPT-6.2 Astra, GPT-6.2 Sol, GPT-6 Astra, GPT-6.1 Sol, GPT-6 Sol, GPT-6 Luna, and GPT-5.6 models (including dated snapshots), `max` is passed through as Codex `max`. For other models, the existing compatibility mapping sends `xhigh`; choose an explicit lower effort if the model requires it. `extra` is an alias for `max`.
 
 `ultra` is passed through unchanged and requires support from your selected model, Codex CLI, and account. It combines maximum reasoning with subagent delegation where supported. GPT-6 Luna supports `max`, but not `ultra`.
 
@@ -153,7 +153,7 @@ Review the generated diff, inspect any changed files, and apply only when the pa
 - `~/github.pat` format: first line GitHub username, second line PAT/token
 - `VYBE_CODEX_MODE` accepts `fast`, `2x`, `slow`, or `normal`
 - `VYBE_CODEX_REASONING_EFFORT` accepts `low`, `medium`, `high`, `xhigh`, `extra`, `max`, or `ultra`
-- `VYBE_CODEX_MODEL` overrides the default `gpt-6-astra` model
+- `VYBE_CODEX_MODEL` overrides the default `gpt-6.2-astra` model
 - `VYBE_CODEX_VERBOSITY` accepts `low`, `medium`, or `high`
 - do not hardcode secrets into the script
 

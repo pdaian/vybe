@@ -66,7 +66,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 SCRIPT_PATH = Path(__file__).resolve()
 
 CODEX_BINARY = "codex"
-CODEX_MODEL = "gpt-6-astra"
+CODEX_MODEL = "gpt-6.2-astra"
 CODEX_SANDBOX = "workspace-write"
 CODEX_REASONING_EFFORT = "max"
 CODEX_VERBOSITY = "high"
@@ -855,7 +855,10 @@ def get_codex_model() -> str:
 def get_codex_reasoning_effort() -> ReasoningEffort:
     raw = os.environ.get(CODEX_REASONING_ENV_VAR, CODEX_REASONING_EFFORT).strip().lower()
     model = get_codex_model()
-    max_models = ("gpt-5.6", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna")
+    max_models = (
+        "gpt-6.2-astra", "gpt-6.2-sol", "gpt-5.6", "gpt-6-astra",
+        "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna",
+    )
     supports_max = any(model == name or model.startswith(name + "-") for name in max_models)
     max_value = "max" if supports_max else "xhigh"
     aliases = {
